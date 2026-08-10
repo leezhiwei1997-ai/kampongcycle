@@ -45,10 +45,16 @@ export function deadlineMillis(r) {
  * still open, and counting it against the merchant would be wrong.
  */
 export function classify(r, now = Date.now()) {
-  if (r?.status === 'collected') return 'collected';
-  if (r?.status === 'cancelled') return 'cancelled';
+  switch (r?.status) {
+    case 'collected': return 'collected';
+    case 'cancelled': return 'cancelled';
+    case 'no_show': return 'noShow';
+    case 'merchant_shortfall': return 'merchantFault';
+    default: break;
+  }
   const deadline = deadlineMillis(r);
-  if (deadline != null && now > deadline) return 'noShow';
+  // Uncollected and past its window, but nobody has said whose fault it was.
+  if (deadline != null && now > deadline) return 'needsReview';
   return 'awaiting';
 }
 
@@ -75,7 +81,7 @@ export function computeEarnings(reservations = [], now = Date.now()) {
     today: 0, week: 0, month: 0, all: 0,
   };
   const counts = {
-    collected: 0, awaiting: 0, noShow: 0, cancelled: 0,
+    collected: 0, awaiting: 0, noShow: 0, merchantFault: 0, needsReview: 0, cancelled: 0,
   };
   const byDish = new Map();
 
@@ -100,17 +106,23 @@ export function computeEarnings(reservations = [], now = Date.now()) {
     byDish.set(key, entry);
   });
 
-  // Denominator is RESOLVED reservations only. Including still-open ones
-  // would drag the rate down every time a new order comes in, which would
-  // make the number useless as a signal.
-  const resolved = counts.collected + counts.noShow;
+  // Two different questions, two different numbers.
+  //
+  // Fulfilment measures what the MERCHANT controls, so a customer no-show is
+  // excluded from it — penalising a stall because someone didn't turn up
+  // would make the metric something to resent rather than act on. Unresolved
+  // expiries DO count against it, otherwise never attributing anything would
+  // hold the rate at 100% forever.
+  const fulfilmentDenom = counts.collected + counts.merchantFault + counts.needsReview;
+  const noShowDenom = counts.collected + counts.noShow;
 
   return {
     revenueCents,
     counts,
-    resolved,
+    resolved: fulfilmentDenom,
     mealsSaved: counts.collected,
-    fulfilmentRate: resolved === 0 ? null : counts.collected / resolved,
+    noShowRate: noShowDenom === 0 ? null : counts.noShow / noShowDenom,
+    fulfilmentRate: fulfilmentDenom === 0 ? null : counts.collected / fulfilmentDenom,
     topDishes: [...byDish.values()]
       .sort((a, b) => b.count - a.count || b.revenueCents - a.revenueCents)
       .slice(0, 3),

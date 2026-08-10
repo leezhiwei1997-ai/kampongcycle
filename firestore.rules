@@ -79,9 +79,16 @@ service cloud.firestore {
                     && request.resource.data.customerUid == request.auth.uid;
       // The merchant who owns the reservation can mark it collected —
       // and only that one field pair, nothing else about the record.
+      // The merchant who owns the reservation closes it out: collected, or
+      // not-collected with a reason. `resolvedAt` joins the allowlist so
+      // fault attribution can be written; everything else about the record
+      // — price, customer, item — stays immutable after creation.
       allow update: if isSignedIn()
                     && resource.data.merchantEmail == request.auth.token.email
-                    && request.resource.data.diff(resource.data).affectedKeys().hasOnly(['status', 'collectedAt']);
+                    && request.resource.data.diff(resource.data).affectedKeys()
+                         .hasOnly(['status', 'collectedAt', 'resolvedAt'])
+                    && request.resource.data.status in
+                         ['pending', 'collected', 'no_show', 'merchant_shortfall', 'cancelled'];
       allow delete: if false;
     }
 

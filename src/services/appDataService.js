@@ -6,10 +6,11 @@
 
 import {
   collection, addDoc, getDocs, deleteDoc, doc, query, where,
-  orderBy, serverTimestamp, getCountFromServer, setDoc, updateDoc, increment,
+  orderBy, serverTimestamp, getCountFromServer, setDoc, updateDoc, increment, limit,
 } from 'firebase/firestore';
 import { db } from '../config/firebase';
 import { isListable } from '../utils/listings';
+import { makeOrderId } from '../utils/reservations';
 
 const DEALS_COLLECTION = 'deals';
 const RESERVATIONS_COLLECTION = 'reservations';
@@ -119,6 +120,9 @@ export async function reserveFoodDeal(dealId, deal, customer) {
     // earnings view needs has to be copied here at reservation time.
     priceCents: toCents(deal?.price),
     collectByTimestamp: deal?.collectByTimestamp ?? null,
+    // Human-readable code shown to the customer and encoded in their pickup
+    // QR. The Firestore doc ID is still the real key — this is for people.
+    orderId: makeOrderId(),
     customerUid: customer?.uid || null,
     customerName: customer?.name || 'A customer',
     customerEmail: customer?.email || null,
@@ -181,6 +185,55 @@ export async function markReservationCollected(reservationId) {
     collectedAt: serverTimestamp(),
   });
   return { success: true };
+}
+
+/**
+ * Closes out a reservation that was never collected, recording WHY.
+ *
+ * The app can tell that a pickup window passed with the food uncollected;
+ * it cannot tell whether the customer failed to show or the stall ran out.
+ * That's a human judgement, so it's stored rather than derived — and it
+ * matters, because a no-show shouldn't count against the merchant's
+ * fulfilment rate while a shortfall should.
+ *
+ * outcome: 'no_show' | 'merchant_shortfall'
+ */
+export async function resolveReservation(reservationId, outcome) {
+  if (outcome !== 'no_show' && outcome !== 'merchant_shortfall') {
+    throw new Error('Outcome must be no_show or merchant_shortfall.');
+  }
+  await updateDoc(doc(db, RESERVATIONS_COLLECTION, reservationId), {
+    status: outcome,
+    resolvedAt: serverTimestamp(),
+  });
+  return { success: true };
+}
+
+/**
+ * Looks up a reservation by its human/QR order code.
+ *
+ * Deliberately a single equality filter: adding `where('merchantEmail')`
+ * alongside it would need a composite index. The merchant check happens
+ * client-side below instead, which costs one extra document read and no
+ * index maintenance.
+ *
+ * Order codes are not guaranteed unique (see makeOrderId), so this fetches
+ * a handful and picks the one belonging to this merchant.
+ */
+export async function findReservationByOrderId(orderId, merchantEmail) {
+  const code = String(orderId || '').trim().toUpperCase();
+  if (!code) return null;
+
+  const snap = await getDocs(
+    query(collection(db, RESERVATIONS_COLLECTION), where('orderId', '==', code), limit(5)),
+  );
+  const matches = snap.docs
+    .map((d) => ({ id: d.id, ...d.data() }))
+    .filter((r) => r.merchantEmail === merchantEmail);
+
+  if (matches.length === 0) return null;
+  // Prefer one that still needs collecting over an already-closed duplicate.
+  return matches.find((r) => r.status === 'pending') || matches[0];
 }
 
 /**

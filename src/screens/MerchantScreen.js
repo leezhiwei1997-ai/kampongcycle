@@ -19,13 +19,17 @@ import { identifyDishFromImage } from '../services/geminiService';
 import {
   fetchDealsForMerchant, publishFoodDeal, updateFoodDeal, removeFoodDeal,
   getImpactStats, getMerchantRatingStats,
-  fetchReservationsForMerchant, markReservationCollected,
+  fetchReservationsForMerchant, markReservationCollected, resolveReservation, findReservationByOrderId,
   getFollowerCount, getReviewsForMerchant,
 } from '../services/appDataService';
 import StarRating from '../components/StarRating';
 import CollectByBadge from '../components/CollectByBadge';
 import { splitListings, archiveReason, portionsLeft } from '../utils/listings';
 import EarningsTab from '../components/EarningsTab';
+import ScanToCollect from '../components/ScanToCollect';
+import {
+  classifyReservation, groupByDay, STATUS_LABEL, needsAction,
+} from '../utils/reservations';
 import { sendPushNotification } from '../services/notificationService';
 import { getUserById } from '../services/authService';
 import { useAuth } from '../context/AuthContext';
@@ -464,6 +468,7 @@ function ReservationsTab({ theme }) {
   const [reservations, setReservations] = useState([]);
   const [isLoading, setIsLoading] = useState(true);
   const [isRefreshing, setIsRefreshing] = useState(false);
+  const [scanVisible, setScanVisible] = useState(false);
 
   const load = useCallback(async () => {
     try {
@@ -483,31 +488,58 @@ function ReservationsTab({ theme }) {
     load();
   }, [load]);
 
+  const notifyCollected = useCallback((reservation) => {
+    if (!reservation?.customerUid) return;
+    getUserById(reservation.customerUid).then((customer) => {
+      if (customer?.pushToken) {
+        sendPushNotification(
+          customer.pushToken,
+          'Order collected \u2705',
+          `Your ${reservation.item} has been marked as picked up. Enjoy!`,
+        );
+      }
+    }).catch(() => {});
+  }, []);
+
   const handleMarkCollected = useCallback(async (reservationId, reservation) => {
     try {
       await markReservationCollected(reservationId);
       setReservations((prev) => prev.map(
         (r) => (r.id === reservationId ? { ...r, status: 'collected' } : r),
       ));
+      notifyCollected(reservation);
+    } catch (err) {
+      Alert.alert('Could not update', err.message || 'Please try again.');
+    }
+  }, [notifyCollected]);
 
-      if (reservation?.customerUid) {
-        getUserById(reservation.customerUid).then((customer) => {
-          if (customer?.pushToken) {
-            sendPushNotification(
-              customer.pushToken,
-              'Order collected ✅',
-              `Your ${reservation.item} has been marked as picked up. Enjoy!`,
-            );
-          }
-        }).catch(() => {});
-      }
+  // Returns an error string to show inside the scanner, or nothing on success
+  // — so a bad scan doesn't close the sheet and make them start over.
+  const handleScannedCode = useCallback(async (code) => {
+    const match = await findReservationByOrderId(code, user.email);
+    if (!match) return 'No order with that code at this stall.';
+    if (match.status === 'collected') return 'That order was already collected.';
+    if (match.status === 'no_show' || match.status === 'merchant_shortfall') {
+      return 'That order was already closed.';
+    }
+    await markReservationCollected(match.id);
+    setReservations((prev) => prev.map(
+      (r) => (r.id === match.id ? { ...r, status: 'collected' } : r),
+    ));
+    notifyCollected(match);
+    return null;
+  }, [user.email, notifyCollected]);
+
+  const handleResolve = useCallback(async (reservationId, outcome) => {
+    try {
+      await resolveReservation(reservationId, outcome);
+      setReservations((prev) => prev.map(
+        (r) => (r.id === reservationId ? { ...r, status: outcome } : r),
+      ));
     } catch (err) {
       Alert.alert('Could not update', err.message || 'Please try again.');
     }
   }, []);
-
-  const pending = reservations.filter((r) => r.status !== 'collected');
-  const collected = reservations.filter((r) => r.status === 'collected');
 
   if (isLoading) {
     return (
@@ -517,56 +549,110 @@ function ReservationsTab({ theme }) {
     );
   }
 
+  const days = groupByDay(reservations);
+  const openCount = needsAction(reservations).length;
+
   return (
     <ScrollView
       style={styles.tabContent}
       refreshControl={<RefreshControl refreshing={isRefreshing} onRefresh={handleRefresh} />}
     >
-      <Text variant="titleMedium" style={styles.sectionTitle}>
-        Awaiting Pickup ({pending.length})
+      <Button
+        mode="contained"
+        icon="qrcode-scan"
+        onPress={() => setScanVisible(true)}
+        style={{ marginBottom: 12 }}
+      >
+        Scan pickup code
+      </Button>
+
+      <Text variant="bodySmall" style={{ color: theme.colors.onSurfaceVariant, marginBottom: 8 }}>
+        {openCount === 0 ? 'Nothing outstanding.' : `${openCount} order${openCount === 1 ? '' : 's'} still open`}
       </Text>
-      {pending.length === 0 ? (
-        <Text style={styles.emptyText}>No pending reservations right now.</Text>
-      ) : (
-        pending.map((r) => (
-          <Card key={r.id} style={styles.dealCard} mode="elevated">
-            <Card.Content style={styles.dealCardContent}>
-              <View style={{ flex: 1 }}>
-                <Text variant="titleSmall">{r.item}</Text>
-                <Text variant="bodySmall" style={{ color: theme.colors.onSurfaceVariant }}>
-                  {r.customerName} · {formatRelativeTime(r.reservedAtMillis)}
-                </Text>
-              </View>
-              <Button mode="contained" onPress={() => handleMarkCollected(r.id, r)} compact>
-                Mark Collected
-              </Button>
-            </Card.Content>
-          </Card>
-        ))
+
+      {days.length === 0 && (
+        <Text style={styles.emptyText}>No reservations yet.</Text>
       )}
 
-      {collected.length > 0 && (
-        <>
+      {days.map((day) => (
+        <View key={day.key}>
           <Text variant="titleMedium" style={styles.sectionTitle}>
-            Collected ({collected.length})
+            {day.label} · {day.collected}/{day.total} collected
           </Text>
-          {collected.map((r) => (
-            <Card key={r.id} style={[styles.dealCard, { opacity: 0.6 }]} mode="elevated">
-              <Card.Content style={styles.dealCardContent}>
-                <View style={{ flex: 1 }}>
-                  <Text variant="titleSmall">{r.item}</Text>
-                  <Text variant="bodySmall" style={{ color: theme.colors.onSurfaceVariant }}>
-                    {r.customerName} · {formatRelativeTime(r.reservedAtMillis)}
-                  </Text>
-                </View>
-                <Text variant="bodySmall" style={{ color: theme.colors.primary, fontWeight: 'bold' }}>
-                  ✓ Collected
-                </Text>
-              </Card.Content>
-            </Card>
-          ))}
-        </>
-      )}
+
+          {day.items.map((r) => {
+            const state = classifyReservation(r);
+            const done = state !== 'awaiting' && state !== 'needsReview';
+            return (
+              <Card
+                key={r.id}
+                style={[styles.dealCard, done && { opacity: 0.65 }]}
+                mode={state === 'needsReview' ? 'outlined' : 'elevated'}
+              >
+                <Card.Content>
+                  <View style={styles.dealCardContent}>
+                    <View style={{ flex: 1 }}>
+                      <Text variant="titleSmall">{r.item}</Text>
+                      <Text variant="bodySmall" style={{ color: theme.colors.onSurfaceVariant }}>
+                        {r.customerName} · {formatRelativeTime(r.reservedAtMillis)}
+                      </Text>
+                      <Text
+                        variant="bodySmall"
+                        style={{ color: theme.colors.outline, marginTop: 2, letterSpacing: 1 }}
+                      >
+                        {r.orderId || r.id}
+                      </Text>
+                      <Text
+                        variant="bodySmall"
+                        style={{
+                          marginTop: 4,
+                          fontWeight: 'bold',
+                          color: state === 'collected' ? theme.colors.primary
+                            : state === 'needsReview' ? theme.colors.error
+                              : theme.colors.onSurfaceVariant,
+                        }}
+                      >
+                        {STATUS_LABEL[state]}
+                      </Text>
+                    </View>
+
+                    {state === 'awaiting' && (
+                      <Button mode="contained" onPress={() => handleMarkCollected(r.id, r)} compact>
+                        Collected
+                      </Button>
+                    )}
+                  </View>
+
+                  {state === 'needsReview' && (
+                    <View style={{ marginTop: 10 }}>
+                      <Text variant="bodySmall" style={{ color: theme.colors.onSurfaceVariant, marginBottom: 6 }}>
+                        The pickup window closed and this wasn&apos;t collected. What happened?
+                      </Text>
+                      <View style={{ flexDirection: 'row', gap: 8 }}>
+                        <Button mode="outlined" compact onPress={() => handleResolve(r.id, 'no_show')}>
+                          Customer no-show
+                        </Button>
+                        <Button mode="outlined" compact onPress={() => handleResolve(r.id, 'merchant_shortfall')}>
+                          We ran out
+                        </Button>
+                      </View>
+                      <Button mode="text" compact onPress={() => handleMarkCollected(r.id, r)}>
+                        Actually collected
+                      </Button>
+                    </View>
+                  )}
+                </Card.Content>
+              </Card>
+            );
+          })}
+        </View>
+      ))}
+
+      <ScanToCollect
+        visible={scanVisible}
+        onDismiss={() => setScanVisible(false)}
+        onCode={handleScannedCode}
+      />
     </ScrollView>
   );
 }

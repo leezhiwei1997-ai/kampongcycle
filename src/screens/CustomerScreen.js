@@ -22,6 +22,8 @@ import { formatRelativeTime } from '../utils/time';
 import { scheduleLocalNotification, sendPushNotification } from '../services/notificationService';
 import { getUserByEmail } from '../services/authService';
 import SwipeDealCard from '../components/SwipeDealCard';
+import PickupQrCode from '../components/PickupQrCode';
+import { classifyReservation, STATUS_LABEL } from '../utils/reservations';
 import StarRating from '../components/StarRating';
 import { useAuth } from '../context/AuthContext';
 
@@ -554,9 +556,15 @@ function OrdersTab({ theme }) {
                 <Text variant="bodySmall" style={{ color: theme.colors.onSurfaceVariant, marginTop: 2 }}>
                   {r.stall || r.merchantEmail} · {formatRelativeTime(r.reservedAtMillis)}
                 </Text>
-                <Text variant="bodySmall" style={{ color: theme.colors.secondary, fontWeight: 'bold', marginTop: 4 }}>
-                  ⏳ Awaiting pickup
+                <Text variant="bodySmall" style={{ color: theme.colors.outline, marginTop: 2, letterSpacing: 1 }}>
+                  {r.orderId || r.id}
                 </Text>
+                <Text variant="bodySmall" style={{ color: theme.colors.secondary, fontWeight: 'bold', marginTop: 4 }}>
+                  {classifyReservation(r) === 'needsReview'
+                    ? '⚠️ Pickup window closed'
+                    : `⏳ ${STATUS_LABEL[classifyReservation(r)]}`}
+                </Text>
+                {classifyReservation(r) === 'awaiting' && <PickupQrCode orderId={r.orderId} />}
               </Card.Content>
             </Card>
           ))}
