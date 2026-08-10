@@ -11,7 +11,7 @@ import {
 import {
   fetchAllDealsForAdmin, removeFoodDeal, getImpactStats,
 } from '../services/appDataService';
-import { listUsers } from '../services/authService';
+import { listUsers, approveMerchant } from '../services/authService';
 import { useAuth } from '../context/AuthContext';
 
 export default function AdminScreen() {
@@ -60,6 +60,17 @@ export default function AdminScreen() {
     ]);
   }, []);
 
+  const handleApproveMerchant = useCallback(async (uid) => {
+    try {
+      await approveMerchant(uid);
+      setUsers((prev) => prev.map((u) => (u.uid === uid ? { ...u, verified: true } : u)));
+    } catch (err) {
+      Alert.alert('Could not approve', err.message || 'Please try again.');
+    }
+  }, []);
+
+  const pendingMerchants = users.filter((u) => u.role === 'merchant' && !u.verified);
+
   const merchantCount = users.filter((u) => u.role === 'merchant').length;
   const customerCount = users.filter((u) => u.role === 'customer').length;
 
@@ -107,6 +118,27 @@ export default function AdminScreen() {
             </Card>
           </View>
 
+          <Text variant="titleMedium" style={styles.sectionTitle}>
+            Pending Merchant Verifications ({pendingMerchants.length})
+          </Text>
+          {pendingMerchants.length === 0 ? (
+            <Text style={styles.emptyText}>No merchants waiting on approval.</Text>
+          ) : (
+            pendingMerchants.map((u) => (
+              <Card key={u.uid} style={styles.userRow} mode="elevated">
+                <Card.Content style={styles.dealCardContent}>
+                  <View style={{ flex: 1 }}>
+                    <Text variant="titleSmall">{u.name}</Text>
+                    <Text variant="bodySmall" style={{ color: theme.colors.onSurfaceVariant }}>{u.email}</Text>
+                  </View>
+                  <Button mode="contained" onPress={() => handleApproveMerchant(u.uid)} compact>
+                    Approve
+                  </Button>
+                </Card.Content>
+              </Card>
+            ))
+          )}
+
           <Text variant="titleMedium" style={styles.sectionTitle}>All Active Listings ({deals.length})</Text>
           {deals.length === 0 ? (
             <Text style={styles.emptyText}>No active listings right now.</Text>
@@ -136,6 +168,14 @@ export default function AdminScreen() {
                 <View>
                   <Text variant="titleSmall">{u.name}</Text>
                   <Text variant="bodySmall" style={{ color: theme.colors.onSurfaceVariant }}>{u.email}</Text>
+                  {u.role === 'merchant' && (
+                    <Text
+                      variant="bodySmall"
+                      style={{ color: u.verified ? theme.colors.primary : theme.colors.error, fontWeight: 'bold', marginTop: 2 }}
+                    >
+                      {u.verified ? '✓ Verified' : '⏳ Pending'}
+                    </Text>
+                  )}
                 </View>
                 <Chip
                   compact

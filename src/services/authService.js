@@ -12,7 +12,8 @@ import {
   onAuthStateChanged,
 } from 'firebase/auth';
 import {
-  doc, setDoc, getDoc, getDocs, collection,
+  doc, setDoc, getDoc, getDocs, collection, updateDoc, query, where, limit,
+  onSnapshot,
 } from 'firebase/firestore';
 import { auth, db } from '../config/firebase';
 
@@ -46,6 +47,11 @@ export async function signUp({
     name: name.trim(),
     email: email.trim().toLowerCase(),
     role,
+    // firestore.rules requires exactly this relationship on create:
+    //   verified == (role != 'merchant')
+    // Omitting the field makes the rule comparison fail and the write
+    // is rejected, leaving an Auth account with no profile document.
+    verified: role !== 'merchant',
     createdAt: Date.now(),
   };
   await setDoc(doc(db, 'users', credential.user.uid), profile);
@@ -66,23 +72,105 @@ export async function logOut() {
 }
 
 /**
- * Subscribes to Firebase's live auth state. Fires immediately with the
- * current state, then again on every login/logout/signup. Returns an
- * unsubscribe function — call it in a useEffect cleanup.
+ * Subscribes to auth state AND to the user's Firestore profile document.
+ *
+ * Why two listeners: onAuthStateChanged only fires on login/logout/token
+ * refresh. Editing users/{uid}.role in the Firestore console is not an
+ * auth event, so a one-shot getDoc here would capture the role once and
+ * never update it. onSnapshot makes role changes propagate live.
+ *
+ * The callback is deliberately NOT async. An async callback here means
+ * overlapping in-flight reads on token refresh, and whichever resolves
+ * last wins — which is how state ends up depending on network timing
+ * rather than on what Firestore currently holds.
+ *
+ * Emits: { status, user, error }
+ *   'loading'   — waiting for auth or the first profile snapshot
+ *   'signedOut' — no Firebase Auth user
+ *   'noProfile' — signed in, but users/{uid} does not exist
+ *   'error'     — the profile listener failed (error holds the code)
+ *   'ready'     — user is populated and current
+ *
+ * Returns an unsubscribe function — call it in a useEffect cleanup.
  */
 export function subscribeToAuthChanges(callback) {
-  return onAuthStateChanged(auth, async (firebaseUser) => {
+  let unsubProfile = null;
+  const stopProfile = () => {
+    if (unsubProfile) {
+      unsubProfile();
+      unsubProfile = null;
+    }
+  };
+
+  const unsubAuth = onAuthStateChanged(auth, (firebaseUser) => {
+    // Always tear down the previous uid's listener before attaching a new
+    // one, or listeners stack across logins and race each other.
+    stopProfile();
+
     if (!firebaseUser) {
-      callback(null);
+      callback({ status: 'signedOut', user: null, error: null });
       return;
     }
-    const profile = await getUserProfile(firebaseUser.uid);
-    callback(profile ? { uid: firebaseUser.uid, ...profile } : null);
+
+    callback({ status: 'loading', user: null, error: null });
+
+    unsubProfile = onSnapshot(
+      doc(db, 'users', firebaseUser.uid),
+      (snap) => {
+        if (!snap.exists()) {
+          callback({ status: 'noProfile', user: null, error: null });
+          return;
+        }
+    const data = snap.data();
+        callback({
+          status: 'ready',
+          user: {
+            uid: firebaseUser.uid,
+            ...data,
+            // Values typed or pasted into the Firestore console routinely
+            // carry stray whitespace and newlines. Normalise on read so a
+            // paste artefact can't change which screen someone lands on.
+            role: typeof data.role === 'string' ? data.role.trim() : data.role,
+            email: typeof data.email === 'string' ? data.email.trim().toLowerCase() : data.email,
+          },
+          error: null,
+        });
+      },
+      (err) => {
+        callback({ status: 'error', user: null, error: err.code || String(err) });
+      },
+    );
   });
+
+  return () => {
+    stopProfile();
+    unsubAuth();
+  };
 }
 
 /** Admin-only helper: list all registered accounts. */
 export async function listUsers() {
   const snap = await getDocs(usersCollection());
   return snap.docs.map((d) => ({ uid: d.id, ...d.data() }));
+}
+
+/** Saves this user's Expo push token to their profile so others can be notified. */
+export async function updatePushToken(uid, pushToken) {
+  await updateDoc(doc(db, 'users', uid), { pushToken });
+  return { success: true };
+}
+
+/** Looks up a user's profile (including pushToken) by email — used to notify a merchant. */
+export async function getUserByEmail(email) {
+  const snap = await getDocs(
+    query(usersCollection(), where('email', '==', email.toLowerCase()), limit(1)),
+  );
+  if (snap.empty) return null;
+  const d = snap.docs[0];
+  return { uid: d.id, ...d.data() };
+}
+
+/** Looks up a user's profile (including pushToken) by uid — used to notify a customer. */
+export async function getUserById(uid) {
+  return getUserProfile(uid);
 }

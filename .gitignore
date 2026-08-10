@@ -40,3 +40,6 @@ yarn-error.*
 # generated native folders
 /ios
 /android
+*.zip
+README-PATCH.md
+README-EARNINGS.md

@@ -1,23 +1,24 @@
 // src/context/AuthContext.js
 import React, {
-  createContext, useContext, useState, useEffect, useCallback,
+  createContext, useContext, useState, useEffect, useCallback, useMemo,
 } from 'react';
 import * as authService from '../services/authService';
 
 const AuthContext = createContext(null);
 
+const INITIAL = { status: 'loading', user: null, error: null };
+
 export function AuthProvider({ children }) {
-  const [user, setUser] = useState(null);
-  const [isLoading, setIsLoading] = useState(true);
+  // One state object rather than separate user/isLoading, so the two can
+  // never disagree — e.g. isLoading false while user is still stale.
+  const [authState, setAuthState] = useState(INITIAL);
 
   useEffect(() => {
-    // subscribeToAuthChanges fires immediately with the current state,
-    // then again automatically after login/signup/logout — so we don't
-    // need to manually setUser() inside login/signUp/logout below.
-    const unsubscribe = authService.subscribeToAuthChanges((nextUser) => {
-      setUser(nextUser);
-      setIsLoading(false);
-    });
+    // subscribeToAuthChanges now emits {status, user, error} and keeps a
+    // live onSnapshot on users/{uid}, so a role edit in the Firestore
+    // console reaches the app without a reload. It returns its own
+    // cleanup, which tears down both listeners.
+    const unsubscribe = authService.subscribeToAuthChanges(setAuthState);
     return unsubscribe;
   }, []);
 
@@ -37,11 +38,17 @@ export function AuthProvider({ children }) {
     await authService.logOut();
   }, []);
 
+  const value = useMemo(() => ({
+    ...authState,
+    // Derived, so existing consumers that read isLoading keep working.
+    isLoading: authState.status === 'loading',
+    login,
+    signUp,
+    logout,
+  }), [authState, login, signUp, logout]);
+
   return (
-    <AuthContext.Provider value={{
-      user, isLoading, login, signUp, logout,
-    }}
-    >
+    <AuthContext.Provider value={value}>
       {children}
     </AuthContext.Provider>
   );

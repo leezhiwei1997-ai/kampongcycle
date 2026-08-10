@@ -1,17 +1,36 @@
-import React from 'react';
+import React, { useEffect } from 'react';
 import { View, StyleSheet } from 'react-native';
 import { PaperProvider, ActivityIndicator } from 'react-native-paper';
 import { AuthProvider, useAuth } from './src/context/AuthContext';
 import { paperTheme } from './src/theme/paperTheme';
+import { registerForPushNotifications } from './src/services/notificationService';
+import { updatePushToken } from './src/services/authService';
+import ProblemView from './src/components/ProblemView';
 import LoginScreen from './src/screens/LoginScreen';
 import CustomerScreen from './src/screens/CustomerScreen';
 import MerchantScreen from './src/screens/MerchantScreen';
 import AdminScreen from './src/screens/AdminScreen';
 
 function Router() {
-  const { user, isLoading } = useAuth();
+  const {
+    status, user, error, logout,
+  } = useAuth();
 
-  if (isLoading) {
+  // Depend on the uid, NOT the whole user object. The profile is now a live
+  // onSnapshot, so `user` is a new object on every document change — and
+  // updatePushToken() below writes to that same document. Keying this effect
+  // on `user` would make it: write token -> snapshot -> effect reruns ->
+  // write token -> ... a self-feeding write loop. The uid only changes on a
+  // real login/logout, which is when this should actually run.
+  const uid = user?.uid ?? null;
+  useEffect(() => {
+    if (!uid) return;
+    registerForPushNotifications().then((token) => {
+      if (token) updatePushToken(uid, token).catch(() => {});
+    });
+  }, [uid]);
+
+  if (status === 'loading') {
     return (
       <View style={styles.loadingContainer}>
         <ActivityIndicator size="large" />
@@ -19,10 +38,46 @@ function Router() {
     );
   }
 
-  if (!user) return <LoginScreen />;
-  if (user.role === 'admin') return <AdminScreen />;
-  if (user.role === 'merchant') return <MerchantScreen />;
-  return <CustomerScreen />;
+  if (status === 'signedOut') return <LoginScreen />;
+
+  if (status === 'error') {
+    return (
+      <ProblemView
+        message="Couldn't read your profile from Firestore."
+        detail={error}
+        onSignOut={logout}
+      />
+    );
+  }
+
+  if (status === 'noProfile') {
+    return (
+      <ProblemView
+        message="You're signed in, but there's no users/ document for this account."
+        onSignOut={logout}
+      />
+    );
+  }
+
+  // No default fallthrough to CustomerScreen. An unrecognised role now shows
+  // itself on screen instead of silently rendering the customer app.
+  // The `key` forces a remount on role change so mount effects re-run.
+  switch (user.role) {
+    case 'admin':
+      return <AdminScreen key="admin" />;
+    case 'merchant':
+      return <MerchantScreen key="merchant" />;
+    case 'customer':
+      return <CustomerScreen key="customer" />;
+    default:
+      return (
+        <ProblemView
+          message="This account has a role the app doesn't handle."
+          detail={`role = ${JSON.stringify(user.role)} · type ${typeof user.role} · len ${String(user.role).length}`}
+          onSignOut={logout}
+        />
+      );
+  }
 }
 
 export default function App() {

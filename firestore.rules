@@ -1,0 +1,70 @@
+rules_version = '2';
+service cloud.firestore {
+  match /databases/{database}/documents {
+
+    function isSignedIn() {
+      return request.auth != null;
+    }
+
+    function isAdmin() {
+      return isSignedIn()
+        && exists(/databases/$(database)/documents/users/$(request.auth.uid))
+        && get(/databases/$(database)/documents/users/$(request.auth.uid)).data.role == 'admin';
+    }
+
+    match /users/{userId} {
+      allow read: if isSignedIn();
+      allow create: if isSignedIn()
+                    && request.auth.uid == userId
+                    && request.resource.data.role in ['customer', 'merchant'];
+      allow update: if isSignedIn()
+                    && request.auth.uid == userId
+                    && request.resource.data.role == resource.data.role;
+      allow delete: if false;
+    }
+
+    match /deals/{dealId} {
+      allow read: if isSignedIn();
+      allow create: if isSignedIn()
+                    && request.resource.data.merchantEmail == request.auth.token.email;
+
+      // The merchant who owns the listing can edit anything about it.
+      allow update: if isSignedIn()
+                    && resource.data.merchantEmail == request.auth.token.email;
+
+      // A customer reserving a portion: quantity must drop by exactly 1,
+      // and nothing else about the listing may change in that request.
+      allow update: if isSignedIn()
+                    && request.resource.data.diff(resource.data).affectedKeys().hasOnly(['quantity'])
+                    && request.resource.data.quantity == resource.data.quantity - 1;
+
+      allow delete: if isSignedIn()
+                    && (resource.data.merchantEmail == request.auth.token.email
+                        || isAdmin()
+                        || resource.data.quantity <= 1);
+    }
+
+    match /reservations/{reservationId} {
+      allow read: if isSignedIn();
+      allow create: if isSignedIn()
+                    && request.resource.data.customerUid == request.auth.uid;
+      // The merchant who owns the reservation can mark it collected —
+      // and only that one field pair, nothing else about the record.
+      allow update: if isSignedIn()
+                    && resource.data.merchantEmail == request.auth.token.email
+                    && request.resource.data.diff(resource.data).affectedKeys().hasOnly(['status', 'collectedAt']);
+      allow delete: if false;
+    }
+
+    match /ratings/{ratingId} {
+      allow read: if isSignedIn();
+      allow create, update: if isSignedIn()
+                    && ratingId == request.auth.uid + '__' + request.resource.data.merchantEmail
+                    && request.resource.data.customerUid == request.auth.uid
+                    && request.resource.data.rating is int
+                    && request.resource.data.rating >= 1
+                    && request.resource.data.rating <= 5;
+      allow delete: if false;
+    }
+  }
+}
