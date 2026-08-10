@@ -12,21 +12,41 @@ service cloud.firestore {
         && get(/databases/$(database)/documents/users/$(request.auth.uid)).data.role == 'admin';
     }
 
+    function isVerifiedMerchant() {
+      return isSignedIn()
+        && exists(/databases/$(database)/documents/users/$(request.auth.uid))
+        && get(/databases/$(database)/documents/users/$(request.auth.uid)).data.verified == true;
+    }
+
     match /users/{userId} {
       allow read: if isSignedIn();
+
+      // Merchants start unverified; customers start (trivially) verified.
+      // Nobody can self-assign verified: true at signup.
       allow create: if isSignedIn()
                     && request.auth.uid == userId
-                    && request.resource.data.role in ['customer', 'merchant'];
+                    && request.resource.data.role in ['customer', 'merchant']
+                    && request.resource.data.verified == (request.resource.data.role != 'merchant');
+
+      // A user editing their own profile can't touch role or verified —
+      // those are admin-controlled below.
       allow update: if isSignedIn()
                     && request.auth.uid == userId
-                    && request.resource.data.role == resource.data.role;
+                    && request.resource.data.role == resource.data.role
+                    && request.resource.data.verified == resource.data.verified;
+
+      // Only an admin can flip verified, and only that one field.
+      allow update: if isAdmin()
+                    && request.resource.data.diff(resource.data).affectedKeys().hasOnly(['verified']);
+
       allow delete: if false;
     }
 
     match /deals/{dealId} {
       allow read: if isSignedIn();
       allow create: if isSignedIn()
-                    && request.resource.data.merchantEmail == request.auth.token.email;
+                    && request.resource.data.merchantEmail == request.auth.token.email
+                    && isVerifiedMerchant();
 
       // The merchant who owns the listing can edit anything about it.
       allow update: if isSignedIn()
@@ -34,14 +54,23 @@ service cloud.firestore {
 
       // A customer reserving a portion: quantity must drop by exactly 1,
       // and nothing else about the listing may change in that request.
+      // The >= 0 floor is new — the client guards against reserving a
+      // sold-out listing, but a client guard isn't a guarantee, and without
+      // this a listing could be driven negative.
       allow update: if isSignedIn()
                     && request.resource.data.diff(resource.data).affectedKeys().hasOnly(['quantity'])
-                    && request.resource.data.quantity == resource.data.quantity - 1;
+                    && request.resource.data.quantity == resource.data.quantity - 1
+                    && request.resource.data.quantity >= 0;
 
+      // CHANGED: the old rule also allowed deletion by anyone when
+      // `resource.data.quantity <= 1`. That existed so a customer taking the
+      // last portion could delete the listing. Reservations no longer delete
+      // anything (sold-out listings are archived at quantity 0 instead), so
+      // that clause is now pure vandalism surface: any signed-in customer
+      // could destroy any merchant's last-portion listing. Removed.
       allow delete: if isSignedIn()
                     && (resource.data.merchantEmail == request.auth.token.email
-                        || isAdmin()
-                        || resource.data.quantity <= 1);
+                        || isAdmin());
     }
 
     match /reservations/{reservationId} {
@@ -65,6 +94,16 @@ service cloud.firestore {
                     && request.resource.data.rating >= 1
                     && request.resource.data.rating <= 5;
       allow delete: if false;
+    }
+
+    match /follows/{followId} {
+      allow read: if isSignedIn();
+      allow create: if isSignedIn()
+                    && followId == request.auth.uid + '__' + request.resource.data.merchantEmail
+                    && request.resource.data.customerUid == request.auth.uid;
+      allow update: if false;
+      allow delete: if isSignedIn()
+                    && resource.data.customerUid == request.auth.uid;
     }
   }
 }

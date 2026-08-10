@@ -9,6 +9,7 @@ import {
   orderBy, serverTimestamp, getCountFromServer, setDoc, updateDoc, increment,
 } from 'firebase/firestore';
 import { db } from '../config/firebase';
+import { isListable } from '../utils/listings';
 
 const DEALS_COLLECTION = 'deals';
 const RESERVATIONS_COLLECTION = 'reservations';
@@ -34,7 +35,9 @@ async function fetchAllDealsRaw() {
 export async function fetchFoodDeals() {
   const now = Date.now();
   const all = await fetchAllDealsRaw();
-  return all.filter((d) => !d.collectByTimestamp || d.collectByTimestamp > now);
+  // Sold-out listings now stay in the collection instead of being deleted,
+  // so the feed has to filter on quantity as well as the pickup window.
+  return all.filter((d) => isListable(d, now));
 }
 
 /** Only the deals a specific merchant listed — used by the merchant dashboard. Includes expired ones so merchants can clean them up. */
@@ -99,6 +102,12 @@ export async function removeFoodDeal(dealId) {
  * Function using a Firestore transaction for true atomicity.
  */
 export async function reserveFoodDeal(dealId, deal, customer) {
+  // Guard BEFORE writing the reservation. Without this a sold-out listing
+  // would still record a reservation and push quantity negative.
+  if ((deal?.quantity ?? 1) <= 0) {
+    throw new Error('Sorry, that portion has just been taken.');
+  }
+
   await addDoc(collection(db, RESERVATIONS_COLLECTION), {
     dealId,
     merchantEmail: deal?.merchantEmail || null,
@@ -117,14 +126,12 @@ export async function reserveFoodDeal(dealId, deal, customer) {
     reservedAt: serverTimestamp(),
   });
 
-  const dealRef = doc(db, DEALS_COLLECTION, dealId);
-  const currentQuantity = deal?.quantity ?? 1;
-
-  if (currentQuantity <= 1) {
-    await deleteDoc(dealRef);
-  } else {
-    await updateDoc(dealRef, { quantity: increment(-1) });
-  }
+  // Always decrement, never delete. A sold-out listing at quantity 0 is
+  // archived (see utils/listings.js) rather than destroyed, so the merchant
+  // keeps the record and can edit it back into circulation. Deleting also
+  // required a rules clause that let ANY signed-in user delete any listing
+  // down to its last portion.
+  await updateDoc(doc(db, DEALS_COLLECTION, dealId), { quantity: increment(-1) });
 
   return { success: true, dealId };
 }

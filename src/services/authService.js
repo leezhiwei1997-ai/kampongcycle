@@ -121,18 +121,9 @@ export function subscribeToAuthChanges(callback) {
           callback({ status: 'noProfile', user: null, error: null });
           return;
         }
-    const data = snap.data();
         callback({
           status: 'ready',
-          user: {
-            uid: firebaseUser.uid,
-            ...data,
-            // Values typed or pasted into the Firestore console routinely
-            // carry stray whitespace and newlines. Normalise on read so a
-            // paste artefact can't change which screen someone lands on.
-            role: typeof data.role === 'string' ? data.role.trim() : data.role,
-            email: typeof data.email === 'string' ? data.email.trim().toLowerCase() : data.email,
-          },
+          user: { uid: firebaseUser.uid, ...snap.data() },
           error: null,
         });
       },
@@ -154,10 +145,26 @@ export async function listUsers() {
   return snap.docs.map((d) => ({ uid: d.id, ...d.data() }));
 }
 
-/** Saves this user's Expo push token to their profile so others can be notified. */
+/**
+ * Saves this user's Expo push token to their profile so others can be
+ * notified. Returns a result instead of throwing, but NEVER fails silently
+ * — a swallowed permission error here is exactly why "push doesn't work"
+ * is so hard to diagnose: the send side looks fine, the token was just
+ * never stored.
+ *
+ * Most common failure: the users/{uid} document has no `verified` field, so
+ * the rules' `request.resource.data.verified == resource.data.verified`
+ * comparison fails and the whole update is denied.
+ */
 export async function updatePushToken(uid, pushToken) {
-  await updateDoc(doc(db, 'users', uid), { pushToken });
-  return { success: true };
+  try {
+    await updateDoc(doc(db, 'users', uid), { pushToken });
+    return { success: true };
+  } catch (err) {
+    const code = err?.code || String(err);
+    console.warn(`[push] could not save token for ${uid}: ${code}`);
+    return { success: false, error: code };
+  }
 }
 
 /** Looks up a user's profile (including pushToken) by email — used to notify a merchant. */

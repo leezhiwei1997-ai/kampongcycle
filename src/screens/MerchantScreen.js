@@ -24,6 +24,7 @@ import {
 } from '../services/appDataService';
 import StarRating from '../components/StarRating';
 import CollectByBadge from '../components/CollectByBadge';
+import { splitListings, archiveReason, portionsLeft } from '../utils/listings';
 import EarningsTab from '../components/EarningsTab';
 import { sendPushNotification } from '../services/notificationService';
 import { getUserById } from '../services/authService';
@@ -256,6 +257,10 @@ function ListingsTab({ theme }) {
     ]);
   }, []);
 
+  // Derived on every render from quantity + collectByTimestamp — nothing is
+  // written to mark a listing expired, so it's correct the moment it renders.
+  const { active: activeDeals, archived: archivedDeals } = splitListings(myDeals);
+
   return (
     <ScrollView
       style={styles.tabContent}
@@ -303,15 +308,15 @@ function ListingsTab({ theme }) {
       </Card>
 
       <Text variant="titleMedium" style={styles.sectionTitle}>
-        Your Active Listings ({myDeals.length})
+        Your Active Listings ({activeDeals.length})
       </Text>
 
       {isLoadingDeals ? (
         <ActivityIndicator size="large" style={{ marginTop: 20 }} />
-      ) : myDeals.length === 0 ? (
+      ) : activeDeals.length === 0 ? (
         <Text style={styles.emptyText}>No active listings. Snap a meal above to add one.</Text>
       ) : (
-        myDeals.map((deal) => (
+        activeDeals.map((deal) => (
           <Card key={deal.id} style={styles.dealCard} mode="elevated">
             <Card.Content style={styles.dealCardContent}>
               {deal.image && <Avatar.Image size={48} source={{ uri: deal.image }} style={{ marginRight: 12 }} />}
@@ -336,6 +341,34 @@ function ListingsTab({ theme }) {
             </Card.Content>
           </Card>
         ))
+      )}
+
+      {archivedDeals.length > 0 && (
+        <>
+          <Text variant="titleMedium" style={styles.sectionTitle}>
+            Archived ({archivedDeals.length})
+          </Text>
+          {archivedDeals.map((deal) => (
+            <Card key={deal.id} style={[styles.dealCard, { opacity: 0.65 }]} mode="outlined">
+              <Card.Content style={styles.dealCardContent}>
+                <View style={{ flex: 1 }}>
+                  <Text variant="titleSmall">{deal.item}</Text>
+                  <Text variant="bodySmall" style={{ color: theme.colors.onSurfaceVariant, marginTop: 2 }}>
+                    {archiveReason(deal)} · {portionsLeft(deal)} left
+                  </Text>
+                </View>
+                <View style={{ alignItems: 'flex-end' }}>
+                  <Button mode="outlined" onPress={() => openEditModal(deal)} compact style={{ marginBottom: 6 }}>
+                    Relist
+                  </Button>
+                  <Button mode="text" textColor={theme.colors.error} onPress={() => handleRemoveDeal(deal.id)} compact>
+                    Delete
+                  </Button>
+                </View>
+              </Card.Content>
+            </Card>
+          ))}
+        </>
       )}
 
       <Portal>
