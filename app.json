@@ -24,6 +24,12 @@
     },
     "web": {
       "favicon": "./assets/favicon.png"
-    }
+    },
+    "extra": {
+      "eas": {
+        "projectId": "4cee67e2-76d8-4b5c-91d7-519fb221319b"
+      }
+    },
+    "owner": "zhiweilee"
   }
 }
