@@ -15,15 +15,20 @@ import {
   fetchFoodDeals, reserveFoodDeal, getImpactStats,
   getRatingStatsForMerchants, submitRating, fetchReservationsForCustomer,
   fetchFollowedMerchants, followStall, unfollowStall, getFollowerCountsForMerchants,
-  getReviewsForMerchant, fetchFollowedStalls,
+  getReviewsForMerchant, fetchFollowedStalls, confirmPickupByScan,
 } from '../services/appDataService';
 import { distanceKm, formatDistance } from '../utils/geo';
 import { formatRelativeTime } from '../utils/time';
 import { scheduleLocalNotification, sendPushNotification } from '../services/notificationService';
 import { getUserByEmail } from '../services/authService';
 import SwipeDealCard from '../components/SwipeDealCard';
-import PickupQrCode from '../components/PickupQrCode';
-import { classifyReservation, STATUS_LABEL } from '../utils/reservations';
+import ConfirmPickupScanner from '../components/ConfirmPickupScanner';
+import OrderCard from '../components/OrderCard';
+import MyOrdersSummary from '../components/MyOrdersSummary';
+import {
+  classifyReservation, STATUS_LABEL, canReview, reviewAvailableAt, canConfirmPickup,
+  groupByDay, isResolvedState,
+} from '../utils/reservations';
 import StarRating from '../components/StarRating';
 import { useAuth } from '../context/AuthContext';
 
@@ -228,10 +233,10 @@ function DiscoverTab({ theme, stallFilter, onClearStallFilter }) {
     try {
       await reserveFoodDeal(deal.id, deal, { uid: user.uid, name: user.name, email: user.email });
       setMealsSaved((prev) => (prev === null ? 1 : prev + 1));
-      setRatingTarget({ merchantEmail: deal.merchantEmail, stall: deal.stall, item: deal.item });
-      setSelectedStars(0);
-      setReviewComment('');
-      setRatingModalVisible(true);
+      // Deliberately NOT opening the rating modal here. At this point the
+      // customer has reserved food they have not collected, let alone eaten
+      // — any stars they give would be rating the app, not the meal. The
+      // prompt now lives in My Orders, an hour after collection.
 
       scheduleLocalNotification(
         'Reservation confirmed! 🎉',
@@ -496,6 +501,61 @@ function OrdersTab({ theme }) {
   const [isLoading, setIsLoading] = useState(true);
   const [isRefreshing, setIsRefreshing] = useState(false);
 
+  // Reviews live here, not in Discover: a review is about food that has been
+  // collected and eaten, so this is the only screen where the customer is in
+  // a position to write one honestly.
+  const [scanVisible, setScanVisible] = useState(false);
+  const [collapsed, setCollapsed] = useState({});
+  const [reviewTarget, setReviewTarget] = useState(null);
+  const [stars, setStars] = useState(0);
+  const [comment, setComment] = useState('');
+  const [isSubmitting, setIsSubmitting] = useState(false);
+
+  // Returns an error string to show inside the scanner, or null on success.
+  const handleScan = useCallback(async (payload) => {
+    try {
+      const res = await confirmPickupByScan(payload, user.uid);
+      setReservations((prev) => prev.map(
+        (r) => (r.id === res.reservationId ? { ...r, status: 'collected', collectedAtMillis: Date.now() } : r),
+      ));
+      return null;
+    } catch (err) {
+      return err.message || 'Could not confirm that pickup.';
+    }
+  }, [user.uid]);
+
+  const closeReview = useCallback(() => {
+    setReviewTarget(null);
+    setStars(0);
+    setComment('');
+  }, []);
+
+  const openReview = useCallback((r) => {
+    setStars(0);
+    setComment('');
+    setReviewTarget(r);
+  }, []);
+
+  const handleSubmitReview = useCallback(async () => {
+    if (!reviewTarget || stars === 0) return;
+    setIsSubmitting(true);
+    try {
+      await submitRating({
+        merchantEmail: reviewTarget.merchantEmail,
+        customerUid: user.uid,
+        customerName: user.name,
+        rating: stars,
+        comment,
+        item: reviewTarget.item,
+      });
+      closeReview();
+    } catch (err) {
+      Alert.alert('Could not submit review', err.message || 'Please try again.');
+    } finally {
+      setIsSubmitting(false);
+    }
+  }, [reviewTarget, stars, comment, user, closeReview]);
+
   const load = useCallback(async () => {
     try {
       setReservations(await fetchReservationsForCustomer(user.uid));
@@ -514,8 +574,8 @@ function OrdersTab({ theme }) {
     load();
   }, [load]);
 
-  const pending = reservations.filter((r) => r.status !== 'collected');
-  const collected = reservations.filter((r) => r.status === 'collected');
+  // Orders are now grouped by day rather than split pending/collected — the
+  // day header carries the collected count for that day.
 
   if (isLoading) {
     return (
@@ -544,53 +604,89 @@ function OrdersTab({ theme }) {
       style={styles.tabContent}
       refreshControl={<RefreshControl refreshing={isRefreshing} onRefresh={handleRefresh} />}
     >
-      {pending.length > 0 && (
-        <>
-          <Text variant="titleMedium" style={styles.sectionTitle}>
-            Awaiting Pickup ({pending.length})
-          </Text>
-          {pending.map((r) => (
-            <Card key={r.id} style={styles.orderCard} mode="elevated">
-              <Card.Content>
-                <Text variant="titleSmall">{r.item}</Text>
-                <Text variant="bodySmall" style={{ color: theme.colors.onSurfaceVariant, marginTop: 2 }}>
-                  {r.stall || r.merchantEmail} · {formatRelativeTime(r.reservedAtMillis)}
-                </Text>
-                <Text variant="bodySmall" style={{ color: theme.colors.outline, marginTop: 2, letterSpacing: 1 }}>
-                  {r.orderId || r.id}
-                </Text>
-                <Text variant="bodySmall" style={{ color: theme.colors.secondary, fontWeight: 'bold', marginTop: 4 }}>
-                  {classifyReservation(r) === 'needsReview'
-                    ? '⚠️ Pickup window closed'
-                    : `⏳ ${STATUS_LABEL[classifyReservation(r)]}`}
-                </Text>
-                {classifyReservation(r) === 'awaiting' && <PickupQrCode orderId={r.orderId} />}
-              </Card.Content>
-            </Card>
-          ))}
-        </>
-      )}
+      <MyOrdersSummary reservations={reservations} />
 
-      {collected.length > 0 && (
-        <>
-          <Text variant="titleMedium" style={styles.sectionTitle}>
-            Collected ({collected.length})
+      {groupByDay(reservations).map((day) => {
+        const open = day.items.filter((r) => !isResolvedState(classifyReservation(r)));
+        const done = day.items.filter((r) => isResolvedState(classifyReservation(r)));
+        const showDone = collapsed[day.key];
+
+        return (
+          <View key={day.key}>
+            <Text variant="titleMedium" style={styles.sectionTitle}>
+              {day.label} · {day.collected}/{day.total} collected
+            </Text>
+
+            {open.map((r) => (
+              <OrderCard
+                key={r.id}
+                reservation={r}
+                onConfirm={() => setScanVisible(true)}
+                onReview={openReview}
+              />
+            ))}
+
+            {done.length > 0 && (
+              <>
+                <Button
+                  mode="text"
+                  compact
+                  onPress={() => setCollapsed((c) => ({ ...c, [day.key]: !c[day.key] }))}
+                  style={{ alignSelf: 'flex-start', marginBottom: 8 }}
+                >
+                  {showDone ? 'Hide' : `Show ${done.length} finished`}
+                </Button>
+                {showDone && done.map((r) => (
+                  <OrderCard
+                    key={r.id}
+                    reservation={r}
+                    onConfirm={() => setScanVisible(true)}
+                    onReview={openReview}
+                  />
+                ))}
+              </>
+            )}
+          </View>
+        );
+      })}
+
+      <ConfirmPickupScanner
+        visible={scanVisible}
+        onDismiss={() => setScanVisible(false)}
+        onCode={handleScan}
+      />
+
+      <Portal>
+        <Modal visible={!!reviewTarget} onDismiss={closeReview} contentContainerStyle={styles.ratingModal}>
+          <Text variant="titleMedium" style={{ textAlign: 'center' }}>
+            How was the {reviewTarget?.item}?
           </Text>
-          {collected.map((r) => (
-            <Card key={r.id} style={[styles.orderCard, { opacity: 0.6 }]} mode="elevated">
-              <Card.Content>
-                <Text variant="titleSmall">{r.item}</Text>
-                <Text variant="bodySmall" style={{ color: theme.colors.onSurfaceVariant, marginTop: 2 }}>
-                  {r.stall || r.merchantEmail} · {formatRelativeTime(r.reservedAtMillis)}
-                </Text>
-                <Text variant="bodySmall" style={{ color: theme.colors.primary, fontWeight: 'bold', marginTop: 4 }}>
-                  ✓ Collected
-                </Text>
-              </Card.Content>
-            </Card>
-          ))}
-        </>
-      )}
+          <Text variant="bodySmall" style={{ textAlign: 'center', color: theme.colors.onSurfaceVariant, marginTop: 4 }}>
+            {reviewTarget?.stall || reviewTarget?.merchantEmail}
+          </Text>
+          <View style={{ alignItems: 'center', marginVertical: 16 }}>
+            <StarRating value={stars} onRate={setStars} size={36} />
+          </View>
+          <TextInput
+            mode="outlined"
+            label="Anything to add? (optional)"
+            value={comment}
+            onChangeText={setComment}
+            multiline
+          />
+          <View style={{ flexDirection: 'row', justifyContent: 'space-between', marginTop: 16 }}>
+            <Button mode="outlined" onPress={closeReview} style={{ width: '48%' }}>Not now</Button>
+            <Button
+              mode="contained"
+              onPress={handleSubmitReview}
+              style={{ width: '48%' }}
+              disabled={stars === 0 || isSubmitting}
+            >
+              Submit
+            </Button>
+          </View>
+        </Modal>
+      </Portal>
     </ScrollView>
   );
 }

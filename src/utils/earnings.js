@@ -50,9 +50,16 @@ export function classify(r, now = Date.now()) {
     case 'cancelled': return 'cancelled';
     case 'no_show': return 'noShow';
     case 'merchant_shortfall': return 'merchantFault';
+    case 'disputed': return 'disputed';
     default: break;
   }
   const deadline = deadlineMillis(r);
+  // Handed over but never confirmed by the customer — still in progress until
+  // the grace period runs out, then it's the merchant's to account for.
+  if (r?.status === 'awaiting_handover') {
+    if (deadline != null && now > deadline + 24 * 60 * 60 * 1000) return 'needsReview';
+    return 'awaiting';
+  }
   // Uncollected and past its window, but nobody has said whose fault it was.
   if (deadline != null && now > deadline) return 'needsReview';
   return 'awaiting';
@@ -81,7 +88,7 @@ export function computeEarnings(reservations = [], now = Date.now()) {
     today: 0, week: 0, month: 0, all: 0,
   };
   const counts = {
-    collected: 0, awaiting: 0, noShow: 0, merchantFault: 0, needsReview: 0, cancelled: 0,
+    collected: 0, awaiting: 0, noShow: 0, merchantFault: 0, needsReview: 0, disputed: 0, cancelled: 0,
   };
   const byDish = new Map();
 

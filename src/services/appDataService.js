@@ -5,12 +5,15 @@
 // locally like the old AsyncStorage version.
 
 import {
-  collection, addDoc, getDocs, deleteDoc, doc, query, where,
+  collection, addDoc, getDocs, getDoc, deleteDoc, doc, query, where,
   orderBy, serverTimestamp, getCountFromServer, setDoc, updateDoc, increment, limit,
+  onSnapshot,
 } from 'firebase/firestore';
 import { db } from '../config/firebase';
 import { isListable } from '../utils/listings';
-import { makeOrderId } from '../utils/reservations';
+import {
+  makeOrderId, makeNonce, decodeHandover, canHandOver, HANDOVER_TTL_MS,
+} from '../utils/reservations';
 
 const DEALS_COLLECTION = 'deals';
 const RESERVATIONS_COLLECTION = 'reservations';
@@ -115,6 +118,9 @@ export async function reserveFoodDeal(dealId, deal, customer) {
     stall: deal?.stall || null,
     item: deal?.item || null,
     price: deal?.price || null,
+    // Copied, not referenced: the deal document is deleted when its last
+    // portion goes, so a thumbnail looked up later would be a broken image.
+    image: deal?.image || null,
     // Snapshotted onto the reservation, not looked up later: the deal
     // document is DELETED when its last portion goes, so anything the
     // earnings view needs has to be copied here at reservation time.
@@ -141,6 +147,64 @@ export async function reserveFoodDeal(dealId, deal, customer) {
 }
 
 /** Every reservation for one merchant, newest first — used by the merchant's "Reservations" tab. */
+
+/**
+ * Fills in `image` for reservations made before it was snapshotted onto them.
+ *
+ * Since the archive change, sold-out deals stay in the collection at
+ * quantity 0 instead of being deleted, so most historical dealIds still
+ * resolve. Only listings a merchant explicitly removed are gone for good —
+ * those keep the placeholder.
+ *
+ * One read per distinct missing deal, deduped, capped so a long order history
+ * can't fan out into hundreds of reads.
+ */
+const IMAGE_HYDRATE_LIMIT = 25;
+
+async function hydrateImages(reservations) {
+  const missing = [...new Set(
+    reservations.filter((r) => !r.image && r.dealId).map((r) => r.dealId),
+  )].slice(0, IMAGE_HYDRATE_LIMIT);
+
+  if (missing.length === 0) return reservations;
+
+  const found = new Map();
+  await Promise.all(missing.map(async (dealId) => {
+    try {
+      const snap = await getDoc(doc(db, DEALS_COLLECTION, dealId));
+      if (snap.exists() && snap.data().image) found.set(dealId, snap.data().image);
+    } catch {
+      // Deleted listing or denied read — placeholder is the correct outcome.
+    }
+  }));
+
+  const withDealImages = reservations.map((r) => (
+    !r.image && found.has(r.dealId) ? { ...r, image: found.get(r.dealId) } : r
+  ));
+
+  // Second pass, free: some deals were hard-deleted under the old
+  // delete-on-sellout behaviour, so there's nothing left to read. But the same
+  // stall usually relists the same dish with the same photo, and other rows in
+  // this batch may already have it. Match on merchant + dish name.
+  //
+  // Best-guess, not fact: if a stall reused a dish name with a different photo,
+  // this shows the newer one. That's a thumbnail, and the alternative is a grey
+  // placeholder, so the trade is worth it — but don't build anything on this
+  // field that needs to be exactly right.
+  const byDish = new Map();
+  withDealImages.forEach((r) => {
+    if (!r.image || !r.item) return;
+    const key = `${r.merchantEmail}|${r.item}`;
+    if (!byDish.has(key)) byDish.set(key, r.image);
+  });
+
+  return withDealImages.map((r) => {
+    if (r.image || !r.item) return r;
+    const guess = byDish.get(`${r.merchantEmail}|${r.item}`);
+    return guess ? { ...r, image: guess, imageIsGuess: true } : r;
+  });
+}
+
 export async function fetchReservationsForMerchant(merchantEmail) {
   const snap = await getDocs(
     query(
@@ -149,14 +213,16 @@ export async function fetchReservationsForMerchant(merchantEmail) {
       orderBy('reservedAt', 'desc'),
     ),
   );
-  return snap.docs.map((d) => {
+  const rows = snap.docs.map((d) => {
     const data = d.data();
     return {
       id: d.id,
       ...data,
       reservedAtMillis: data.reservedAt?.toMillis ? data.reservedAt.toMillis() : null,
+      collectedAtMillis: data.collectedAt?.toMillis ? data.collectedAt.toMillis() : null,
     };
   });
+  return hydrateImages(rows);
 }
 
 /** Every reservation a customer has made, newest first — used by their "My Orders" tab. */
@@ -168,23 +234,86 @@ export async function fetchReservationsForCustomer(customerUid) {
       orderBy('reservedAt', 'desc'),
     ),
   );
-  return snap.docs.map((d) => {
+  const rows = snap.docs.map((d) => {
     const data = d.data();
     return {
       id: d.id,
       ...data,
       reservedAtMillis: data.reservedAt?.toMillis ? data.reservedAt.toMillis() : null,
+      collectedAtMillis: data.collectedAt?.toMillis ? data.collectedAt.toMillis() : null,
     };
   });
+  return hydrateImages(rows);
 }
 
 /** Merchant confirms a customer actually picked up their reserved portion. */
-export async function markReservationCollected(reservationId) {
+/**
+ * Every status change writes here. Append-only by rule — nobody can edit or
+ * delete an entry, including admins. A dispute is only worth reviewing if the
+ * trail behind it can't be rewritten by either party.
+ */
+async function writeAudit(reservationId, entry) {
+  await addDoc(collection(db, RESERVATIONS_COLLECTION, reservationId, 'auditLog'), {
+    ...entry,
+    at: serverTimestamp(),
+  });
+}
+
+/**
+ * MERCHANT: start a handover. Writes a short-lived nonce onto the reservation
+ * and returns it for the QR. Does NOT mark anything collected — the merchant
+ * is not permitted to do that, here or in the rules.
+ */
+export async function beginHandover(reservationId, reservation, actorUid) {
+  if (reservation && !canHandOver(reservation)) {
+    throw new Error('That pickup window has closed. Record what happened instead.');
+  }
+  const nonce = makeNonce();
+  const handoverExpiresAt = Date.now() + HANDOVER_TTL_MS;
+
   await updateDoc(doc(db, RESERVATIONS_COLLECTION, reservationId), {
+    status: 'awaiting_handover',
+    handoverNonce: nonce,
+    handoverExpiresAt,
+  });
+  await writeAudit(reservationId, { actor: actorUid, action: 'handover_started' });
+
+  return { nonce, handoverExpiresAt };
+}
+
+/**
+ * CUSTOMER: confirm receipt by scanning the merchant's QR.
+ *
+ * The verification that matters lives in firestore.rules — this function can
+ * be bypassed by anyone with the SDK, the rule cannot. What's checked there:
+ * the caller is the reservation's own customer, the nonce matches, and it
+ * hasn't expired.
+ */
+export async function confirmPickupByScan(scannedPayload, customerUid) {
+  const parsed = decodeHandover(scannedPayload);
+  if (!parsed) throw new Error('That doesn\u2019t look like a pickup code.');
+
+  const ref = doc(db, RESERVATIONS_COLLECTION, parsed.reservationId);
+  const snap = await getDoc(ref);
+  if (!snap.exists()) throw new Error('That order no longer exists.');
+
+  const data = snap.data();
+  if (data.customerUid !== customerUid) throw new Error('That code is for a different customer.');
+  if (data.status === 'collected') throw new Error('That order is already confirmed.');
+  if (data.status !== 'awaiting_handover') throw new Error('The stall hasn\u2019t started the handover yet.');
+  if (!Number.isFinite(data.handoverExpiresAt) || Date.now() > data.handoverExpiresAt) {
+    throw new Error('That code expired. Ask the stall to show it again.');
+  }
+
+  await updateDoc(ref, {
     status: 'collected',
     collectedAt: serverTimestamp(),
+    collectedBy: customerUid,
+    scannedNonce: parsed.nonce,
   });
-  return { success: true };
+  await writeAudit(parsed.reservationId, { actor: customerUid, action: 'collection_confirmed' });
+
+  return { success: true, reservationId: parsed.reservationId, item: data.item };
 }
 
 /**
@@ -198,13 +327,65 @@ export async function markReservationCollected(reservationId) {
  *
  * outcome: 'no_show' | 'merchant_shortfall'
  */
-export async function resolveReservation(reservationId, outcome) {
-  if (outcome !== 'no_show' && outcome !== 'merchant_shortfall') {
-    throw new Error('Outcome must be no_show or merchant_shortfall.');
+export async function resolveReservation(reservationId, outcome, { actorUid, reason } = {}) {
+  const allowed = ['no_show', 'merchant_shortfall', 'disputed'];
+  if (!allowed.includes(outcome)) {
+    throw new Error(`Outcome must be one of ${allowed.join(', ')}.`);
   }
+  if (outcome === 'disputed' && !String(reason || '').trim()) {
+    throw new Error('A dispute needs a reason — an admin has to read it.');
+  }
+
   await updateDoc(doc(db, RESERVATIONS_COLLECTION, reservationId), {
     status: outcome,
     resolvedAt: serverTimestamp(),
+    ...(outcome === 'disputed' ? { disputeReason: String(reason).trim() } : {}),
+  });
+  await writeAudit(reservationId, { actor: actorUid, action: outcome, reason: reason || null });
+  return { success: true };
+}
+
+/**
+ * Watches a single reservation. Used by the merchant's handover modal so it
+ * reacts the moment the customer scans — without this, "the order updates by
+ * itself" was simply untrue and the merchant had to back out and refresh.
+ *
+ * Returns an unsubscribe function.
+ */
+export function subscribeToReservation(reservationId, callback) {
+  return onSnapshot(
+    doc(db, RESERVATIONS_COLLECTION, reservationId),
+    (snap) => callback(snap.exists() ? { id: snap.id, ...snap.data() } : null),
+    () => callback(null),
+  );
+}
+
+/** ADMIN: every reservation waiting on a human decision. */
+export async function fetchDisputedReservations() {
+  const snap = await getDocs(
+    query(collection(db, RESERVATIONS_COLLECTION), where('status', '==', 'disputed')),
+  );
+  return snap.docs.map((d) => {
+    const data = d.data();
+    return {
+      id: d.id,
+      ...data,
+      reservedAtMillis: data.reservedAt?.toMillis ? data.reservedAt.toMillis() : null,
+    };
+  });
+}
+
+/** ADMIN: settle a dispute one way or the other. */
+export async function resolveDispute(reservationId, outcome, { actorUid, resolution } = {}) {
+  const allowed = ['collected', 'no_show', 'merchant_shortfall'];
+  if (!allowed.includes(outcome)) throw new Error('Invalid dispute outcome.');
+
+  await updateDoc(doc(db, RESERVATIONS_COLLECTION, reservationId), {
+    status: outcome,
+    resolvedAt: serverTimestamp(),
+  });
+  await writeAudit(reservationId, {
+    actor: actorUid, action: `dispute_resolved_${outcome}`, resolution: resolution || null,
   });
   return { success: true };
 }

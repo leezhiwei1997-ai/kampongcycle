@@ -10,6 +10,7 @@ import {
 } from 'react-native-paper';
 import {
   fetchAllDealsForAdmin, removeFoodDeal, getImpactStats,
+  fetchDisputedReservations, resolveDispute,
 } from '../services/appDataService';
 import { listUsers, approveMerchant } from '../services/authService';
 import { useAuth } from '../context/AuthContext';
@@ -21,18 +22,21 @@ export default function AdminScreen() {
   const [mealsSaved, setMealsSaved] = useState(0);
   const [deals, setDeals] = useState([]);
   const [users, setUsers] = useState([]);
+  const [disputes, setDisputes] = useState([]);
 
   const loadAll = useCallback(async () => {
     setIsLoading(true);
     try {
-      const [stats, allDeals, allUsers] = await Promise.all([
+      const [stats, allDeals, allUsers, openDisputes] = await Promise.all([
         getImpactStats(),
         fetchAllDealsForAdmin(),
         listUsers(),
+        fetchDisputedReservations(),
       ]);
       setMealsSaved(stats.mealsSaved);
       setDeals(allDeals);
       setUsers(allUsers);
+      setDisputes(openDisputes);
     } catch (err) {
       Alert.alert('Could not load admin data', err.message || 'Please try again.');
     } finally {
@@ -59,6 +63,15 @@ export default function AdminScreen() {
       },
     ]);
   }, []);
+
+  const handleResolveDispute = useCallback(async (reservationId, outcome) => {
+    try {
+      await resolveDispute(reservationId, outcome, { actorUid: user.uid });
+      setDisputes((prev) => prev.filter((d) => d.id !== reservationId));
+    } catch (err) {
+      Alert.alert('Could not resolve', err.message || 'Please try again.');
+    }
+  }, [user.uid]);
 
   const handleApproveMerchant = useCallback(async (uid) => {
     try {
@@ -117,6 +130,41 @@ export default function AdminScreen() {
               </Card.Content>
             </Card>
           </View>
+
+          <Text variant="titleMedium" style={styles.sectionTitle}>
+            Disputes ({disputes.length})
+          </Text>
+          {disputes.length === 0 ? (
+            <Text style={{ color: theme.colors.onSurfaceVariant, marginBottom: 12 }}>
+              Nothing waiting on a decision.
+            </Text>
+          ) : disputes.map((d) => (
+            <Card key={d.id} style={{ marginBottom: 10 }} mode="outlined">
+              <Card.Content>
+                <Text variant="titleSmall">{d.item}</Text>
+                <Text variant="bodySmall" style={{ color: theme.colors.onSurfaceVariant, marginTop: 2 }}>
+                  {d.orderId || d.id} · {d.customerName} · {d.merchantEmail}
+                </Text>
+                <Text variant="bodyMedium" style={{ marginTop: 8 }}>
+                  {d.disputeReason || 'No reason given.'}
+                </Text>
+                <Text variant="bodySmall" style={{ color: theme.colors.onSurfaceVariant, marginTop: 8 }}>
+                  The merchant says they handed this over; the customer never confirmed.
+                </Text>
+                <View style={{ flexDirection: 'row', gap: 8, marginTop: 10, flexWrap: 'wrap' }}>
+                  <Button mode="contained" compact onPress={() => handleResolveDispute(d.id, 'collected')}>
+                    Merchant is right
+                  </Button>
+                  <Button mode="outlined" compact onPress={() => handleResolveDispute(d.id, 'no_show')}>
+                    Customer no-show
+                  </Button>
+                  <Button mode="text" compact onPress={() => handleResolveDispute(d.id, 'merchant_shortfall')}>
+                    Never handed over
+                  </Button>
+                </View>
+              </Card.Content>
+            </Card>
+          ))}
 
           <Text variant="titleMedium" style={styles.sectionTitle}>
             Pending Merchant Verifications ({pendingMerchants.length})

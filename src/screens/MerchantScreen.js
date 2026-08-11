@@ -7,7 +7,7 @@ import {
 } from 'react-native';
 import {
   Text, Button, Card, TextInput, Surface, ActivityIndicator,
-  Portal, Modal, Avatar, useTheme, BottomNavigation, SegmentedButtons,
+  Portal, Modal, Dialog, Avatar, useTheme, BottomNavigation, SegmentedButtons,
 } from 'react-native-paper';
 import * as ImagePicker from 'expo-image-picker';
 import * as ImageManipulator from 'expo-image-manipulator';
@@ -19,16 +19,17 @@ import { identifyDishFromImage } from '../services/geminiService';
 import {
   fetchDealsForMerchant, publishFoodDeal, updateFoodDeal, removeFoodDeal,
   getImpactStats, getMerchantRatingStats,
-  fetchReservationsForMerchant, markReservationCollected, resolveReservation, findReservationByOrderId,
+  fetchReservationsForMerchant, beginHandover, resolveReservation,
   getFollowerCount, getReviewsForMerchant,
 } from '../services/appDataService';
 import StarRating from '../components/StarRating';
 import CollectByBadge from '../components/CollectByBadge';
 import { splitListings, archiveReason, portionsLeft } from '../utils/listings';
 import EarningsTab from '../components/EarningsTab';
-import ScanToCollect from '../components/ScanToCollect';
+import HandoverQr from '../components/HandoverQr';
+import ReservationCard from '../components/ReservationCard';
 import {
-  classifyReservation, groupByDay, STATUS_LABEL, needsAction,
+  classifyReservation, groupByDay, fulfilmentSummary, isResolvedState,
 } from '../utils/reservations';
 import { sendPushNotification } from '../services/notificationService';
 import { getUserById } from '../services/authService';
@@ -468,7 +469,10 @@ function ReservationsTab({ theme }) {
   const [reservations, setReservations] = useState([]);
   const [isLoading, setIsLoading] = useState(true);
   const [isRefreshing, setIsRefreshing] = useState(false);
-  const [scanVisible, setScanVisible] = useState(false);
+  const [handover, setHandover] = useState(null);
+  const [collapsed, setCollapsed] = useState({});
+  const [dispute, setDispute] = useState(null);
+  const [disputeReason, setDisputeReason] = useState('');
 
   const load = useCallback(async () => {
     try {
@@ -488,58 +492,71 @@ function ReservationsTab({ theme }) {
     load();
   }, [load]);
 
-  const notifyCollected = useCallback((reservation) => {
-    if (!reservation?.customerUid) return;
-    getUserById(reservation.customerUid).then((customer) => {
-      if (customer?.pushToken) {
-        sendPushNotification(
-          customer.pushToken,
-          'Order collected \u2705',
-          `Your ${reservation.item} has been marked as picked up. Enjoy!`,
-        );
-      }
-    }).catch(() => {});
-  }, []);
-
-  const handleMarkCollected = useCallback(async (reservationId, reservation) => {
+  const handleHandOver = useCallback(async (r) => {
     try {
-      await markReservationCollected(reservationId);
-      setReservations((prev) => prev.map(
-        (r) => (r.id === reservationId ? { ...r, status: 'collected' } : r),
-      ));
-      notifyCollected(reservation);
+      const { nonce, handoverExpiresAt } = await beginHandover(r.id, r, user.uid);
+      setReservations((prev) => prev.map((x) => (x.id === r.id
+        ? { ...x, status: 'awaiting_handover', handoverNonce: nonce, handoverExpiresAt }
+        : x)));
+      setHandover({
+        reservationId: r.id,
+        nonce,
+        expiresAt: handoverExpiresAt,
+        issuedAt: Date.now(),
+        item: r.item,
+      });
     } catch (err) {
-      Alert.alert('Could not update', err.message || 'Please try again.');
+      Alert.alert('Could not start handover', err.message || 'Please try again.');
     }
-  }, [notifyCollected]);
+  }, [user.uid]);
 
-  // Returns an error string to show inside the scanner, or nothing on success
-  // — so a bad scan doesn't close the sheet and make them start over.
-  const handleScannedCode = useCallback(async (code) => {
-    const match = await findReservationByOrderId(code, user.email);
-    if (!match) return 'No order with that code at this stall.';
-    if (match.status === 'collected') return 'That order was already collected.';
-    if (match.status === 'no_show' || match.status === 'merchant_shortfall') {
-      return 'That order was already closed.';
+  // Re-issues the nonce in place. Writing a new one invalidates the old
+  // immediately — the rule compares the scan against whatever is currently on
+  // the document — so there's nothing to revoke separately.
+  const handleRefreshQr = useCallback(async () => {
+    if (!handover) return;
+    try {
+      const target = reservations.find((x) => x.id === handover.reservationId);
+      const { nonce, handoverExpiresAt } = await beginHandover(
+        handover.reservationId, target, user.uid,
+      );
+      setReservations((prev) => prev.map((x) => (x.id === handover.reservationId
+        ? { ...x, handoverNonce: nonce, handoverExpiresAt }
+        : x)));
+      setHandover((h) => ({
+        ...h, nonce, expiresAt: handoverExpiresAt, issuedAt: Date.now(),
+      }));
+    } catch (err) {
+      Alert.alert('Could not refresh the code', err.message || 'Please try again.');
     }
-    await markReservationCollected(match.id);
-    setReservations((prev) => prev.map(
-      (r) => (r.id === match.id ? { ...r, status: 'collected' } : r),
-    ));
-    notifyCollected(match);
-    return null;
-  }, [user.email, notifyCollected]);
+  }, [handover, reservations, user.uid]);
 
   const handleResolve = useCallback(async (reservationId, outcome) => {
     try {
-      await resolveReservation(reservationId, outcome);
+      await resolveReservation(reservationId, outcome, { actorUid: user.uid });
       setReservations((prev) => prev.map(
         (r) => (r.id === reservationId ? { ...r, status: outcome } : r),
       ));
     } catch (err) {
       Alert.alert('Could not update', err.message || 'Please try again.');
     }
-  }, []);
+  }, [user.uid]);
+
+  const submitDispute = useCallback(async () => {
+    if (!dispute || !disputeReason.trim()) return;
+    try {
+      await resolveReservation(dispute.id, 'disputed', {
+        actorUid: user.uid, reason: disputeReason,
+      });
+      setReservations((prev) => prev.map(
+        (r) => (r.id === dispute.id ? { ...r, status: 'disputed' } : r),
+      ));
+      setDispute(null);
+      setDisputeReason('');
+    } catch (err) {
+      Alert.alert('Could not raise dispute', err.message || 'Please try again.');
+    }
+  }, [dispute, disputeReason, user.uid]);
 
   if (isLoading) {
     return (
@@ -550,109 +567,122 @@ function ReservationsTab({ theme }) {
   }
 
   const days = groupByDay(reservations);
-  const openCount = needsAction(reservations).length;
+  const summary = fulfilmentSummary(reservations);
 
   return (
     <ScrollView
       style={styles.tabContent}
       refreshControl={<RefreshControl refreshing={isRefreshing} onRefresh={handleRefresh} />}
     >
-      <Button
-        mode="contained"
-        icon="qrcode-scan"
-        onPress={() => setScanVisible(true)}
-        style={{ marginBottom: 12 }}
-      >
-        Scan pickup code
-      </Button>
-
-      <Text variant="bodySmall" style={{ color: theme.colors.onSurfaceVariant, marginBottom: 8 }}>
-        {openCount === 0 ? 'Nothing outstanding.' : `${openCount} order${openCount === 1 ? '' : 's'} still open`}
-      </Text>
-
-      {days.length === 0 && (
-        <Text style={styles.emptyText}>No reservations yet.</Text>
-      )}
-
-      {days.map((day) => (
-        <View key={day.key}>
-          <Text variant="titleMedium" style={styles.sectionTitle}>
-            {day.label} · {day.collected}/{day.total} collected
+      <Card style={{ marginBottom: 12 }} mode="contained">
+        <Card.Content>
+          <View style={{ flexDirection: 'row', alignItems: 'baseline', justifyContent: 'space-between' }}>
+            <Text variant="titleMedium">Fulfilment</Text>
+            <Text variant="headlineSmall" style={{ color: theme.colors.primary }}>
+              {summary.rate == null ? '—' : `${Math.round(summary.rate * 100)}%`}
+            </Text>
+          </View>
+          <Text variant="bodySmall" style={{ color: theme.colors.onSurfaceVariant, marginTop: 4 }}>
+            {summary.counts.collected} collected · {summary.counts.merchantFault} missed · {summary.counts.noShow} no-show
+            {summary.counts.disputed > 0 ? ` · ${summary.counts.disputed} under review` : ''}
           </Text>
+          {(summary.counts.needsReview + summary.counts.unconfirmed) > 0 && (
+            <Text variant="bodySmall" style={{ color: theme.colors.error, marginTop: 4 }}>
+              {summary.counts.needsReview + summary.counts.unconfirmed} order(s) to account for — these count against you until you do
+            </Text>
+          )}
+        </Card.Content>
+      </Card>
 
-          {day.items.map((r) => {
-            const state = classifyReservation(r);
-            const done = state !== 'awaiting' && state !== 'needsReview';
-            return (
-              <Card
+      {days.length === 0 && <Text style={styles.emptyText}>No reservations yet.</Text>}
+
+      {days.map((day) => {
+        const open = day.items.filter((r) => !isResolvedState(classifyReservation(r)));
+        const done = day.items.filter((r) => isResolvedState(classifyReservation(r)));
+        const showDone = collapsed[day.key];
+
+        return (
+          <View key={day.key}>
+            <Text variant="titleMedium" style={styles.sectionTitle}>
+              {day.label} · {day.collected}/{day.total} collected
+            </Text>
+
+            {open.map((r) => (
+              <ReservationCard
                 key={r.id}
-                style={[styles.dealCard, done && { opacity: 0.65 }]}
-                mode={state === 'needsReview' ? 'outlined' : 'elevated'}
-              >
-                <Card.Content>
-                  <View style={styles.dealCardContent}>
-                    <View style={{ flex: 1 }}>
-                      <Text variant="titleSmall">{r.item}</Text>
-                      <Text variant="bodySmall" style={{ color: theme.colors.onSurfaceVariant }}>
-                        {r.customerName} · {formatRelativeTime(r.reservedAtMillis)}
-                      </Text>
-                      <Text
-                        variant="bodySmall"
-                        style={{ color: theme.colors.outline, marginTop: 2, letterSpacing: 1 }}
-                      >
-                        {r.orderId || r.id}
-                      </Text>
-                      <Text
-                        variant="bodySmall"
-                        style={{
-                          marginTop: 4,
-                          fontWeight: 'bold',
-                          color: state === 'collected' ? theme.colors.primary
-                            : state === 'needsReview' ? theme.colors.error
-                              : theme.colors.onSurfaceVariant,
-                        }}
-                      >
-                        {STATUS_LABEL[state]}
-                      </Text>
-                    </View>
+                reservation={r}
+                onHandOver={handleHandOver}
+                onShowCode={(x) => setHandover({
+                  reservationId: x.id,
+                  nonce: x.handoverNonce,
+                  expiresAt: x.handoverExpiresAt,
+                  issuedAt: 0,
+                  item: x.item,
+                })}
+                onResolve={handleResolve}
+                onDispute={(x) => { setDispute(x); setDisputeReason(''); }}
+              />
+            ))}
 
-                    {state === 'awaiting' && (
-                      <Button mode="contained" onPress={() => handleMarkCollected(r.id, r)} compact>
-                        Collected
-                      </Button>
-                    )}
-                  </View>
+            {done.length > 0 && (
+              <>
+                <Button
+                  mode="text"
+                  compact
+                  onPress={() => setCollapsed((c) => ({ ...c, [day.key]: !c[day.key] }))}
+                  style={{ alignSelf: 'flex-start', marginBottom: 8 }}
+                >
+                  {showDone ? 'Hide' : `Show ${done.length} finished`}
+                </Button>
+                {showDone && done.map((r) => (
+                  <ReservationCard
+                    key={r.id}
+                    reservation={r}
+                    onHandOver={handleHandOver}
+                    onShowCode={() => {}}
+                    onResolve={handleResolve}
+                    onDispute={(x) => { setDispute(x); setDisputeReason(''); }}
+                  />
+                ))}
+              </>
+            )}
+          </View>
+        );
+      })}
 
-                  {state === 'needsReview' && (
-                    <View style={{ marginTop: 10 }}>
-                      <Text variant="bodySmall" style={{ color: theme.colors.onSurfaceVariant, marginBottom: 6 }}>
-                        The pickup window closed and this wasn&apos;t collected. What happened?
-                      </Text>
-                      <View style={{ flexDirection: 'row', gap: 8 }}>
-                        <Button mode="outlined" compact onPress={() => handleResolve(r.id, 'no_show')}>
-                          Customer no-show
-                        </Button>
-                        <Button mode="outlined" compact onPress={() => handleResolve(r.id, 'merchant_shortfall')}>
-                          We ran out
-                        </Button>
-                      </View>
-                      <Button mode="text" compact onPress={() => handleMarkCollected(r.id, r)}>
-                        Actually collected
-                      </Button>
-                    </View>
-                  )}
-                </Card.Content>
-              </Card>
-            );
-          })}
-        </View>
-      ))}
-
-      <ScanToCollect
-        visible={scanVisible}
-        onDismiss={() => setScanVisible(false)}
-        onCode={handleScannedCode}
+      <HandoverQr
+        visible={!!handover}
+        onDismiss={() => { setHandover(null); load(); }}
+        reservationId={handover?.reservationId}
+        nonce={handover?.nonce}
+        expiresAt={handover?.expiresAt}
+        issuedAt={handover?.issuedAt}
+        item={handover?.item}
+        onRefresh={handleRefreshQr}
       />
+
+      <Portal>
+        <Dialog visible={!!dispute} onDismiss={() => setDispute(null)}>
+          <Dialog.Title>Raise a dispute</Dialog.Title>
+          <Dialog.Content>
+            <Text variant="bodySmall" style={{ marginBottom: 10 }}>
+              An admin will read this and decide. Say what happened — when you handed
+              it over, and why the customer didn&apos;t confirm.
+            </Text>
+            <TextInput
+              mode="outlined"
+              label="What happened"
+              value={disputeReason}
+              onChangeText={setDisputeReason}
+              multiline
+            />
+          </Dialog.Content>
+          <Dialog.Actions>
+            <Button onPress={() => setDispute(null)}>Cancel</Button>
+            <Button onPress={submitDispute} disabled={!disputeReason.trim()}>Submit</Button>
+          </Dialog.Actions>
+        </Dialog>
+      </Portal>
     </ScrollView>
   );
 }

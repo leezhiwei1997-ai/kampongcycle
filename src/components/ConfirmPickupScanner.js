@@ -1,35 +1,37 @@
-// src/components/ScanToCollect.js
+// src/components/ConfirmPickupScanner.js
 //
-// Merchant scans the customer's pickup QR (or types the code) to mark an
-// order collected.
+// CUSTOMER-side scanner. The customer scans the QR the merchant is holding
+// up to confirm they actually received the food.
+//
+// There is no manual-entry fallback here, and that's deliberate: typing a
+// code you were told over the counter proves nothing about whether food
+// changed hands, which is exactly what this step exists to establish. If the
+// scan genuinely can't happen, the merchant raises a dispute and an admin
+// looks at it.
 //
 // Requires: npx expo install expo-camera
 import React, { useState, useCallback } from 'react';
 import { View, StyleSheet } from 'react-native';
 import {
-  Portal, Modal, Text, Button, TextInput, ActivityIndicator, useTheme,
+  Portal, Modal, Text, Button, ActivityIndicator, useTheme,
 } from 'react-native-paper';
 import { CameraView, useCameraPermissions } from 'expo-camera';
 
-export default function ScanToCollect({ visible, onDismiss, onCode }) {
+export default function ConfirmPickupScanner({ visible, onDismiss, onCode }) {
   const theme = useTheme();
   const [permission, requestPermission] = useCameraPermissions();
-  const [manual, setManual] = useState('');
   const [busy, setBusy] = useState(false);
   const [error, setError] = useState('');
 
   const submit = useCallback(async (raw) => {
-    const code = String(raw || '').trim().toUpperCase();
+    const code = String(raw || '').trim();
     if (!code || busy) return;
     setBusy(true);
     setError('');
     try {
       const message = await onCode(code);
       if (message) setError(message);
-      else {
-        setManual('');
-        onDismiss();
-      }
+      else onDismiss();
     } catch (err) {
       setError(err.message || 'Could not find that order.');
     } finally {
@@ -44,7 +46,10 @@ export default function ScanToCollect({ visible, onDismiss, onCode }) {
         onDismiss={onDismiss}
         contentContainerStyle={[styles.modal, { backgroundColor: theme.colors.background }]}
       >
-        <Text variant="titleMedium" style={{ marginBottom: 10 }}>Scan pickup code</Text>
+        <Text variant="titleMedium" style={{ marginBottom: 4 }}>Confirm pickup</Text>
+        <Text variant="bodySmall" style={{ color: theme.colors.onSurfaceVariant, marginBottom: 10 }}>
+          Scan the code the stall is showing you.
+        </Text>
 
         {!permission?.granted ? (
           <View style={styles.permission}>
@@ -64,16 +69,6 @@ export default function ScanToCollect({ visible, onDismiss, onCode }) {
           </View>
         )}
 
-        <TextInput
-          mode="outlined"
-          label="Or enter the code"
-          value={manual}
-          onChangeText={setManual}
-          autoCapitalize="characters"
-          placeholder="KC-260811-7F4Q"
-          style={{ marginTop: 12 }}
-        />
-
         {!!error && (
           <Text variant="bodySmall" style={{ color: theme.colors.error, marginTop: 8 }}>
             {error}
@@ -84,9 +79,6 @@ export default function ScanToCollect({ visible, onDismiss, onCode }) {
 
         <View style={styles.row}>
           <Button mode="text" onPress={onDismiss}>Cancel</Button>
-          <Button mode="contained" onPress={() => submit(manual)} disabled={!manual || busy}>
-            Collect
-          </Button>
         </View>
       </Modal>
     </Portal>

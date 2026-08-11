@@ -77,19 +77,70 @@ service cloud.firestore {
       allow read: if isSignedIn();
       allow create: if isSignedIn()
                     && request.resource.data.customerUid == request.auth.uid;
-      // The merchant who owns the reservation can mark it collected —
-      // and only that one field pair, nothing else about the record.
-      // The merchant who owns the reservation closes it out: collected, or
-      // not-collected with a reason. `resolvedAt` joins the allowlist so
-      // fault attribution can be written; everything else about the record
-      // — price, customer, item — stays immutable after creation.
+
+      // ---------------------------------------------------------------
+      // COLLECTION IS CUSTOMER-DRIVEN.
+      //
+      // The merchant is the party that gains from a false "collected" —
+      // fulfilment rate, and money once payment lands — so the merchant is
+      // not permitted to write that status at all. The rule below is the
+      // enforcement; the UI merely reflects it.
+      // ---------------------------------------------------------------
+
+      // MERCHANT: start a handover, or account for one that didn't happen.
+      // Note 'collected' is absent from this list, deliberately.
       allow update: if isSignedIn()
                     && resource.data.merchantEmail == request.auth.token.email
                     && request.resource.data.diff(resource.data).affectedKeys()
-                         .hasOnly(['status', 'collectedAt', 'resolvedAt'])
+                         .hasOnly(['status', 'resolvedAt', 'handoverNonce',
+                                   'handoverExpiresAt', 'disputeReason'])
                     && request.resource.data.status in
-                         ['pending', 'collected', 'no_show', 'merchant_shortfall', 'cancelled'];
+                         ['awaiting_handover', 'no_show', 'merchant_shortfall', 'disputed']
+                    && (request.resource.data.status != 'awaiting_handover'
+                        || !('collectByTimestamp' in resource.data)
+                        || resource.data.collectByTimestamp == null
+                        || request.time.toMillis() <= resource.data.collectByTimestamp + 7200000);
+
+      // CUSTOMER: confirm receipt. Four conditions, all required:
+      //   1. it's their own reservation
+      //   2. the merchant has actually started a handover
+      //   3. the nonce they submit matches the one on the document
+      //   4. that nonce hasn't expired
+      //
+      // The nonce is NOT a secret — reservations are readable by any signed-in
+      // user, so a determined customer could read it instead of scanning. That
+      // is acceptable: condition 1 means they can only ever confirm their OWN
+      // order, and a customer falsely confirming their own pickup harms nobody
+      // but themselves. What it stops is the merchant confirming for them.
+      allow update: if isSignedIn()
+                    && resource.data.customerUid == request.auth.uid
+                    && request.resource.data.diff(resource.data).affectedKeys()
+                         .hasOnly(['status', 'collectedAt', 'collectedBy', 'scannedNonce'])
+                    && request.resource.data.status == 'collected'
+                    && resource.data.status == 'awaiting_handover'
+                    && request.resource.data.collectedBy == request.auth.uid
+                    && request.resource.data.scannedNonce == resource.data.handoverNonce
+                    && request.time.toMillis() <= resource.data.handoverExpiresAt;
+
+      // ADMIN: settle a dispute.
+      allow update: if isAdmin()
+                    && resource.data.status == 'disputed'
+                    && request.resource.data.diff(resource.data).affectedKeys()
+                         .hasOnly(['status', 'resolvedAt'])
+                    && request.resource.data.status in
+                         ['collected', 'no_show', 'merchant_shortfall'];
+
       allow delete: if false;
+
+      // Append-only trail. No update, no delete, for anyone — an audit log
+      // either party can rewrite is worse than none, because it looks
+      // authoritative while being unreliable.
+      match /auditLog/{entryId} {
+        allow read: if isSignedIn();
+        allow create: if isSignedIn()
+                      && request.resource.data.actor == request.auth.uid;
+        allow update, delete: if false;
+      }
     }
 
     match /ratings/{ratingId} {
