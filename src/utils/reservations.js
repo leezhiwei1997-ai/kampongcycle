@@ -197,6 +197,9 @@ export function classifyReservation(r, now = Date.now()) {
   return 'awaiting';
 }
 
+/**
+ * Merchant-facing wording. Kept as STATUS_LABEL for compatibility.
+ */
 export const STATUS_LABEL = {
   awaiting: 'Awaiting pickup',
   handingOver: 'Waiting for customer to confirm',
@@ -208,6 +211,49 @@ export const STATUS_LABEL = {
   disputed: 'Under review',
   cancelled: 'Cancelled',
 };
+
+/**
+ * Customer-facing wording for the same states.
+ *
+ * These are NOT translations of the merchant labels — the same state means
+ * something different depending on who's looking. "Waiting for customer to
+ * confirm" is accurate on the merchant's screen and nonsense on the
+ * customer's, where the customer IS the one who has to act.
+ */
+export const CUSTOMER_STATUS_LABEL = {
+  awaiting: 'Awaiting pickup',
+  handingOver: 'Ready — confirm pickup',
+  unconfirmed: 'Not confirmed',
+  needsReview: 'Pickup window closed',
+  collected: 'Collected',
+  noShow: 'Marked as no-show',
+  merchantFault: 'Stall couldn\u2019t fulfil it',
+  disputed: 'Under review',
+  cancelled: 'Cancelled',
+};
+
+/**
+ * The label a customer should see, accounting for one case a bare state
+ * can't express: the merchant started a handover but the 5-minute code has
+ * since expired. The customer can't do anything until the stall re-issues
+ * it, so telling them to "confirm pickup" would be sending them to a button
+ * that isn't there.
+ */
+export function customerStatusLabel(r, now = Date.now()) {
+  const state = classifyReservation(r, now);
+  if (state === 'handingOver' && !handoverIsLive(r, now)) {
+    return 'Ask the stall to show the code again';
+  }
+  return CUSTOMER_STATUS_LABEL[state];
+}
+
+/** Open items a customer or merchant still has to act on, for day headers. */
+export function openCount(items = [], now = Date.now()) {
+  return items.filter((r) => {
+    const state = classifyReservation(r, now);
+    return state === 'awaiting' || state === 'handingOver';
+  }).length;
+}
 
 /** Local midnight for a timestamp — the grouping key for "the day itself". */
 export function dayKey(millis) {

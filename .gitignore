@@ -43,3 +43,5 @@ yarn-error.*
 *.zip
 README-PATCH.md
 README-EARNINGS.md
+*.zip
+README-*.md

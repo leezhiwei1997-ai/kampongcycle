@@ -5,7 +5,7 @@ import {
   Text, Card, Button, useTheme,
 } from 'react-native-paper';
 import {
-  classifyReservation, STATUS_LABEL, statusTone, canConfirmPickup,
+  classifyReservation, statusTone, canConfirmPickup, customerStatusLabel,
   canReview, reviewAvailableAt,
 } from '../utils/reservations';
 import { withAlpha } from '../utils/color';
@@ -42,7 +42,7 @@ export default function OrderCard({ reservation: r, onConfirm, onReview }) {
 
           <View style={styles.body}>
             <View style={[styles.pill, { backgroundColor: withAlpha(accent) }]}>
-              <Text style={[styles.pillText, { color: accent }]}>{STATUS_LABEL[state]}</Text>
+              <Text style={[styles.pillText, { color: accent }]}>{customerStatusLabel(r)}</Text>
             </View>
             <Text variant="titleSmall" style={{ marginTop: 6 }}>{r.item}</Text>
             <Text variant="bodySmall" style={{ color: theme.colors.onSurfaceVariant }}>
@@ -64,6 +64,14 @@ export default function OrderCard({ reservation: r, onConfirm, onReview }) {
         {state === 'awaiting' && (
           <Text variant="bodySmall" style={[styles.hint, { color: theme.colors.onSurfaceVariant }]}>
             Head to the stall — you can confirm once they hand it over and show their code.
+          </Text>
+        )}
+
+        {/* Handover started but the 5-minute code lapsed. Without this the
+            card sits there with a status and no button and no explanation. */}
+        {state === 'handingOver' && !canConfirmPickup(r) && (
+          <Text variant="bodySmall" style={[styles.hint, { color: theme.colors.onSurfaceVariant }]}>
+            The stall&apos;s code expired. Ask them to tap Hand over again.
           </Text>
         )}
 

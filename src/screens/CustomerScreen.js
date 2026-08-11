@@ -3,16 +3,18 @@ import React, {
   useState, useCallback, useEffect, useMemo,
 } from 'react';
 import {
-  View, SafeAreaView, StatusBar, Alert, StyleSheet, RefreshControl, ScrollView,
+  View, SafeAreaView, StatusBar, Alert, StyleSheet, RefreshControl, ScrollView, Dimensions,
 } from 'react-native';
 import {
   Text, Button, Card, Surface, ActivityIndicator, Avatar, useTheme, BottomNavigation, Portal, Modal,
-  Searchbar, Chip, TextInput,
+  Searchbar, Chip, TextInput, Divider, Dialog,
 } from 'react-native-paper';
 import * as Location from 'expo-location';
 
+const SCREEN_W = Dimensions.get('window').width;
+
 import {
-  fetchFoodDeals, reserveFoodDeal, getImpactStats,
+  fetchFoodDeals, reserveFoodDeal,
   getRatingStatsForMerchants, submitRating, fetchReservationsForCustomer,
   fetchFollowedMerchants, followStall, unfollowStall, getFollowerCountsForMerchants,
   getReviewsForMerchant, fetchFollowedStalls, confirmPickupByScan,
@@ -25,18 +27,29 @@ import SwipeDealCard from '../components/SwipeDealCard';
 import ConfirmPickupScanner from '../components/ConfirmPickupScanner';
 import OrderCard from '../components/OrderCard';
 import MyOrdersSummary from '../components/MyOrdersSummary';
+import EcoBadge from '../components/EcoBadge';
+import ProfileStats from '../components/ProfileStats';
+import { computeImpact, recentActivity } from '../utils/impact';
+import { statusTone } from '../utils/reservations';
+import { withAlpha } from '../utils/color';
 import {
   classifyReservation, STATUS_LABEL, canReview, reviewAvailableAt, canConfirmPickup,
-  groupByDay, isResolvedState,
+  groupByDay, isResolvedState, openCount,
 } from '../utils/reservations';
 import StarRating from '../components/StarRating';
 import { useAuth } from '../context/AuthContext';
+
+function timeOfDayGreeting(now = new Date()) {
+  const h = now.getHours();
+  if (h < 12) return 'Good Morning';
+  if (h < 18) return 'Good Afternoon';
+  return 'Good Evening';
+}
 
 function DiscoverTab({ theme, stallFilter, onClearStallFilter }) {
   const { user } = useAuth();
   const [foodDeals, setFoodDeals] = useState([]);
   const [isLoadingDeals, setIsLoadingDeals] = useState(true);
-  const [mealsSaved, setMealsSaved] = useState(null);
   const [cardIndex, setCardIndex] = useState(0);
   const [userLocation, setUserLocation] = useState(null);
   const [locationDenied, setLocationDenied] = useState(false);
@@ -51,6 +64,10 @@ function DiscoverTab({ theme, stallFilter, onClearStallFilter }) {
   const [maxPrice, setMaxPrice] = useState(null); // null | number
   const [maxDistance, setMaxDistance] = useState(null); // null | number (km)
   const [followingOnly, setFollowingOnly] = useState(false);
+  // Drives the "›" affordance on the filter row — hidden once there's
+  // nothing further right to reach.
+  const [filtersAtEnd, setFiltersAtEnd] = useState(false);
+  const greeting = timeOfDayGreeting();
 
   const [followedEmails, setFollowedEmails] = useState(new Set());
   const [followerCounts, setFollowerCounts] = useState(new Map());
@@ -89,15 +106,6 @@ function DiscoverTab({ theme, stallFilter, onClearStallFilter }) {
     }
   }, [user.uid]);
 
-  const loadImpact = useCallback(async () => {
-    try {
-      const stats = await getImpactStats();
-      setMealsSaved(stats.mealsSaved);
-    } catch (err) {
-      setMealsSaved(0);
-    }
-  }, []);
-
   const loadLocation = useCallback(async () => {
     try {
       const { status } = await Location.requestForegroundPermissionsAsync();
@@ -117,10 +125,9 @@ function DiscoverTab({ theme, stallFilter, onClearStallFilter }) {
 
   useEffect(() => {
     loadDeals();
-    loadImpact();
     loadLocation();
     loadFollows();
-  }, [loadDeals, loadImpact, loadLocation, loadFollows]);
+  }, [loadDeals, loadLocation, loadFollows]);
 
   const dealsWithDistance = useMemo(() => {
     const withDistance = foodDeals.map((deal) => {
@@ -232,7 +239,6 @@ function DiscoverTab({ theme, stallFilter, onClearStallFilter }) {
   const handleSwipeRight = useCallback(async (deal) => {
     try {
       await reserveFoodDeal(deal.id, deal, { uid: user.uid, name: user.name, email: user.email });
-      setMealsSaved((prev) => (prev === null ? 1 : prev + 1));
       // Deliberately NOT opening the rating modal here. At this point the
       // customer has reserved food they have not collected, let alone eaten
       // — any stars they give would be rating the app, not the meal. The
@@ -294,31 +300,37 @@ function DiscoverTab({ theme, stallFilter, onClearStallFilter }) {
 
   return (
     <View style={styles.tabContent}>
-      <Surface style={[styles.impactBanner, { backgroundColor: theme.colors.primary }]} elevation={1}>
-        <Text variant="displaySmall" style={styles.impactCount}>
-          {mealsSaved === null ? '—' : mealsSaved}
-        </Text>
-        <Text variant="bodySmall" style={styles.impactLabel}>meals saved from going to waste 🌍</Text>
-      </Surface>
-
-      {locationDenied && (
-        <Text variant="bodySmall" style={{ textAlign: 'center', color: theme.colors.onSurfaceVariant, marginBottom: 8 }}>
-          Enable location access to see distance to each stall
-        </Text>
-      )}
+      {/* The big green "18 meals saved" slab was the loudest thing on the
+          screen and told the customer nothing they could act on. The number
+          still exists — it's on Profile, next to their own contribution,
+          where it means something. */}
+      <Text variant="headlineSmall" style={{ fontWeight: '700' }}>
+        {greeting}, {user.name || 'there'}
+      </Text>
+      <Text variant="bodyMedium" style={{ color: theme.colors.onSurfaceVariant, marginBottom: 10 }}>
+        Rescue these before they go!
+      </Text>
 
       <Searchbar
         placeholder="Search dishes or stalls"
         value={searchQuery}
         onChangeText={setSearchQuery}
         style={styles.searchbar}
+        elevation={0}
       />
 
+      <View style={styles.filterWrap}>
       <ScrollView
         horizontal
         showsHorizontalScrollIndicator={false}
         style={styles.filterRow}
         contentContainerStyle={styles.filterRowContent}
+        scrollEventThrottle={16}
+        onScroll={({ nativeEvent: e }) => {
+          const remaining = e.contentSize.width - e.layoutMeasurement.width - e.contentOffset.x;
+          setFiltersAtEnd(remaining <= 8);
+        }}
+        onContentSizeChange={(w) => setFiltersAtEnd(w <= SCREEN_W - 24)}
       >
         <Chip
           selected={maxPrice === 3}
@@ -365,6 +377,12 @@ function DiscoverTab({ theme, stallFilter, onClearStallFilter }) {
           ❤️ Following
         </Chip>
       </ScrollView>
+        {!filtersAtEnd && (
+          <View pointerEvents="none" style={[styles.filterHint, { backgroundColor: theme.colors.background }]}>
+            <Text style={{ color: theme.colors.onSurfaceVariant, fontSize: 18, fontWeight: '600' }}>›</Text>
+          </View>
+        )}
+      </View>
 
       {!!stallFilter && (
         <View style={styles.stallFilterBanner}>
@@ -413,14 +431,12 @@ function DiscoverTab({ theme, stallFilter, onClearStallFilter }) {
         )}
       </View>
 
-      {!!visibleDeal && (
-        <View style={styles.actionRow}>
-          <Button mode="outlined" onPress={handleSwipeLeft} textColor={theme.colors.error} style={styles.actionButton}>
-            Skip
-          </Button>
-          <Button mode="contained" onPress={() => handleSwipeRight(visibleDeal)} style={styles.actionButton}>
-            Reserve
-          </Button>
+      {filteredDeals.length - cardIndex > 1 && (
+        <View style={{ alignItems: 'center', marginTop: 6 }}>
+          <Text variant="bodySmall" style={{ color: theme.colors.onSurfaceVariant }}>
+            {filteredDeals.length - cardIndex - 1} more to browse
+          </Text>
+          <Text style={{ color: theme.colors.onSurfaceVariant, fontSize: 18, marginTop: 2 }}>⌄</Text>
         </View>
       )}
 
@@ -614,7 +630,14 @@ function OrdersTab({ theme }) {
         return (
           <View key={day.key}>
             <Text variant="titleMedium" style={styles.sectionTitle}>
-              {day.label} · {day.collected}/{day.total} collected
+              {day.label}
+            </Text>
+            {/* Both totals in the header: what still needs doing, and what's
+                already done. "Show N finished" answers only the second. */}
+            <Text variant="bodySmall" style={{ color: theme.colors.onSurfaceVariant, marginBottom: 8 }}>
+              {openCount(day.items) > 0
+                ? `${openCount(day.items)} awaiting pickup · ${day.collected}/${day.total} collected`
+                : `${day.collected}/${day.total} collected`}
             </Text>
 
             {open.map((r) => (
@@ -646,6 +669,7 @@ function OrdersTab({ theme }) {
                 ))}
               </>
             )}
+            <Divider style={{ marginTop: 4, marginBottom: 14 }} />
           </View>
         );
       })}
@@ -695,6 +719,15 @@ function ProfileTab({ theme, onViewStall }) {
   const { user, logout } = useAuth();
   const [followedStalls, setFollowedStalls] = useState([]);
   const [isLoadingFollows, setIsLoadingFollows] = useState(true);
+  const [orders, setOrders] = useState([]);
+  const [confirmUnfollow, setConfirmUnfollow] = useState(null);
+
+  useEffect(() => {
+    fetchReservationsForCustomer(user.uid).then(setOrders).catch(() => setOrders([]));
+  }, [user.uid]);
+
+  const impact = useMemo(() => computeImpact(orders), [orders]);
+  const activity = useMemo(() => recentActivity(orders), [orders]);
 
   const loadFollowedStalls = useCallback(async () => {
     try {
@@ -708,23 +741,31 @@ function ProfileTab({ theme, onViewStall }) {
 
   useEffect(() => { loadFollowedStalls(); }, [loadFollowedStalls]);
 
-  const handleUnfollow = useCallback(async (merchantEmail) => {
+  // Confirmed, not one-tap. Unfollowing is instant and silent, and the
+  // button sits directly beside "View" — an easy misfire that costs the
+  // customer a stall they were tracking.
+  const handleUnfollow = useCallback(async () => {
+    if (!confirmUnfollow) return;
     try {
-      await unfollowStall(user.uid, merchantEmail);
-      setFollowedStalls((prev) => prev.filter((f) => f.merchantEmail !== merchantEmail));
+      await unfollowStall(user.uid, confirmUnfollow.merchantEmail);
+      setFollowedStalls((prev) => prev.filter(
+        (f) => f.merchantEmail !== confirmUnfollow.merchantEmail,
+      ));
     } catch (err) {
       Alert.alert('Could not unfollow', err.message || 'Please try again.');
+    } finally {
+      setConfirmUnfollow(null);
     }
-  }, [user.uid]);
+  }, [user.uid, confirmUnfollow]);
 
   return (
     <ScrollView contentContainerStyle={[styles.tabContent, { alignItems: 'center', paddingTop: 40 }]}>
       <Avatar.Text size={80} label={user.name?.[0]?.toUpperCase() || '?'} style={{ backgroundColor: theme.colors.primary }} />
       <Text variant="titleLarge" style={{ marginTop: 12 }}>{user.name}</Text>
       <Text variant="bodyMedium" style={{ color: theme.colors.onSurfaceVariant }}>{user.email}</Text>
-      <Text variant="bodyMedium" style={{ color: theme.colors.onSurfaceVariant, marginTop: 2 }}>
-        Customer • Kampong Eco Champion 🌿
-      </Text>
+      <EcoBadge role="Customer" impact={impact} />
+
+      <ProfileStats impact={impact} />
 
       <View style={{ width: '100%', marginTop: 28 }}>
         <Text variant="titleMedium" style={styles.sectionTitle}>
@@ -737,27 +778,75 @@ function ProfileTab({ theme, onViewStall }) {
             You&apos;re not following any stalls yet — tap the heart on a deal in Discover.
           </Text>
         ) : (
+          /* Plain rows, not a Card each. One followed stall in an elevated
+             card was taking a quarter of the screen to say one thing. */
           followedStalls.map((f) => (
-            <Card key={f.merchantEmail} style={styles.orderCard} mode="elevated">
-              <Card.Content style={{ flexDirection: 'row', alignItems: 'center', justifyContent: 'space-between' }}>
-                <View style={{ flex: 1 }}>
-                  <Text variant="titleSmall">{f.stall || f.merchantEmail}</Text>
-                </View>
-                <Button compact mode="text" onPress={() => onViewStall(f.merchantEmail, f.stall)}>
-                  View
-                </Button>
-                <Button compact mode="text" textColor={theme.colors.error} onPress={() => handleUnfollow(f.merchantEmail)}>
-                  Unfollow
-                </Button>
-              </Card.Content>
-            </Card>
+            <View key={f.merchantEmail} style={styles.followRow}>
+              <Text variant="bodyLarge" numberOfLines={1} style={{ flex: 1 }}>
+                {f.stall || f.merchantEmail}
+              </Text>
+              <Button compact mode="text" onPress={() => onViewStall(f.merchantEmail, f.stall)}>
+                View
+              </Button>
+              <Button compact mode="text" textColor={theme.colors.error} onPress={() => setConfirmUnfollow(f)}>
+                Unfollow
+              </Button>
+            </View>
           ))
         )}
       </View>
 
-      <Button mode="contained" buttonColor={theme.colors.error} onPress={logout} style={{ marginTop: 24 }}>
+      {activity.length > 0 && (
+        <View style={{ width: '100%', marginTop: 24 }}>
+          <Text variant="titleMedium" style={styles.sectionTitle}>Recent activity</Text>
+          {activity.map((a) => {
+            const tone = {
+              success: theme.colors.primary,
+              warning: theme.colors.secondary,
+              danger: theme.colors.error,
+            }[statusTone(a.state)] || theme.colors.outline;
+
+            return (
+              <View key={a.id} style={styles.activityRow}>
+                <View style={[styles.activityDot, { backgroundColor: tone }]} />
+                <View style={{ flex: 1 }}>
+                  <Text variant="bodyMedium" numberOfLines={1}>
+                    <Text style={{ color: tone, fontWeight: '600' }}>{a.verb}</Text>
+                    {` ${a.item}`}
+                    {/* Stall dropped when it's the same as the row above —
+                        three lines ending "from Hawker Testing" is noise. */}
+                    {a.stall && !a.repeatStall ? ` from ${a.stall}` : ''}
+                  </Text>
+                  <Text variant="bodySmall" style={{ color: theme.colors.onSurfaceVariant }}>
+                    {a.price ? `${a.price} · ` : ''}
+                    {formatRelativeTime(a.atMillis)}
+                    {a.orderId ? ` · ${a.orderId}` : ''}
+                  </Text>
+                </View>
+              </View>
+            );
+          })}
+        </View>
+      )}
+
+      <Button mode="text" textColor={theme.colors.error} onPress={logout} style={{ marginTop: 28 }}>
         Log Out
       </Button>
+
+      <Portal>
+        <Dialog visible={!!confirmUnfollow} onDismiss={() => setConfirmUnfollow(null)}>
+          <Dialog.Title>Unfollow {confirmUnfollow?.stall || 'this stall'}?</Dialog.Title>
+          <Dialog.Content>
+            <Text variant="bodyMedium">
+              You&apos;ll stop seeing their surplus first. You can follow again any time.
+            </Text>
+          </Dialog.Content>
+          <Dialog.Actions>
+            <Button onPress={() => setConfirmUnfollow(null)}>Cancel</Button>
+            <Button textColor={theme.colors.error} onPress={handleUnfollow}>Unfollow</Button>
+          </Dialog.Actions>
+        </Dialog>
+      </Portal>
     </ScrollView>
   );
 }
@@ -811,29 +900,52 @@ export default function CustomerScreen() {
 const styles = StyleSheet.create({
   container: { flex: 1 },
   header: { padding: 20, paddingTop: 40 },
-  tabContent: { flex: 1, padding: 16 },
+  tabContent: { flex: 1, paddingHorizontal: 16, paddingTop: 12, paddingBottom: 8 },
   impactBanner: { borderRadius: 16, padding: 16, marginBottom: 12, alignItems: 'center' },
   impactCount: { color: '#fff', fontWeight: 'bold' },
   impactLabel: { color: '#fff', marginTop: 2, textAlign: 'center' },
-  deckArea: {
-    flex: 1, position: 'relative', overflow: 'hidden',
-  },
+  // flex:1 to claim the remaining height, but the card inside sits at its
+  // natural size at the top — matching the target, where there's breathing
+  // room under the card rather than a stretched one.
+  deckArea: { flex: 1, justifyContent: 'flex-start' },
   emptyDeck: { flex: 1, alignItems: 'center', justifyContent: 'center', padding: 24 },
   actionRow: {
     flexDirection: 'row', justifyContent: 'space-between', paddingVertical: 12, gap: 12,
   },
-  actionButton: { flex: 1 },
+  skipButton: { minWidth: 90 },
+  reserveButton: { flex: 1, marginLeft: 12, borderRadius: 25 },
   orderCard: { marginBottom: 10, borderRadius: 12 },
   sectionTitle: { marginBottom: 12, marginTop: 4, fontWeight: 'bold' },
   emptyText: { fontStyle: 'italic', marginBottom: 12, opacity: 0.7 },
-  searchbar: { marginBottom: 8, borderRadius: 12 },
+  searchbar: {
+    marginBottom: 8, borderRadius: 14, borderWidth: 1, borderColor: '#e3e6e3', backgroundColor: '#fff',
+  },
+  filterWrap: { position: 'relative' },
+  followRow: {
+    flexDirection: 'row', alignItems: 'center', paddingVertical: 6,
+  },
+  activityRow: {
+    flexDirection: 'row', alignItems: 'flex-start', marginBottom: 10,
+  },
+  activityDot: {
+    width: 8, height: 8, borderRadius: 4, marginTop: 7, marginRight: 10,
+  },
   filterRow: {
-    marginBottom: 8, flexGrow: 0,
+    marginBottom: 6, flexGrow: 0,
   },
   filterRowContent: {
-    flexDirection: 'row', gap: 8, paddingRight: 8,
+    flexDirection: 'row', gap: 8, paddingRight: 26,
   },
   filterChip: {},
+  filterHint: {
+    position: 'absolute',
+    right: 0,
+    top: 0,
+    bottom: 8,
+    width: 24,
+    alignItems: 'center',
+    justifyContent: 'center',
+  },
   stallFilterBanner: {
     flexDirection: 'row', alignItems: 'center', justifyContent: 'space-between',
     backgroundColor: '#f0f0f0', borderRadius: 10, paddingLeft: 12, paddingVertical: 2, marginBottom: 8,

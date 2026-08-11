@@ -72,6 +72,8 @@ export async function publishFoodDeal(deal) {
   const payload = {
     ...deal,
     priceCents: toCents(deal?.price),
+    originalPrice: deal?.originalPrice || null,
+    originalPriceCents: toCents(deal?.originalPrice),
     createdAt: serverTimestamp(),
   };
   const docRef = await addDoc(dealsRef(), payload);
@@ -172,15 +174,26 @@ async function hydrateImages(reservations) {
   await Promise.all(missing.map(async (dealId) => {
     try {
       const snap = await getDoc(doc(db, DEALS_COLLECTION, dealId));
-      if (snap.exists() && snap.data().image) found.set(dealId, snap.data().image);
+      if (snap.exists()) {
+        const d = snap.data();
+        if (d.image || d.originalPrice) {
+          found.set(dealId, { image: d.image || null, originalPrice: d.originalPrice || null });
+        }
+      }
     } catch {
       // Deleted listing or denied read — placeholder is the correct outcome.
     }
   }));
 
-  const withDealImages = reservations.map((r) => (
-    !r.image && found.has(r.dealId) ? { ...r, image: found.get(r.dealId) } : r
-  ));
+  const withDealImages = reservations.map((r) => {
+    const hit = found.get(r.dealId);
+    if (!hit) return r;
+    return {
+      ...r,
+      image: r.image || hit.image || null,
+      originalPrice: r.originalPrice || hit.originalPrice || null,
+    };
+  });
 
   // Second pass, free: some deals were hard-deleted under the old
   // delete-on-sellout behaviour, so there's nothing left to read. But the same

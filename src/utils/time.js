@@ -8,28 +8,31 @@ export function formatCollectBy(collectByTimestamp) {
   if (!collectByTimestamp) return { label: null, urgency: 'normal' };
 
   const remainingMs = collectByTimestamp - Date.now();
+  if (remainingMs <= 0) return { label: 'Pickup window closed', urgency: 'expired' };
 
-  if (remainingMs <= 0) {
-    return { label: 'Collection window closed', urgency: 'expired' };
-  }
+  const endLabel = new Date(collectByTimestamp)
+    .toLocaleTimeString([], { hour: 'numeric', minute: '2-digit' });
 
-  if (remainingMs < HOUR_MS) {
-    const mins = Math.ceil(remainingMs / MINUTE_MS);
-    return {
-      label: `Collect within ${mins} min`,
-      urgency: mins <= 15 ? 'urgent' : 'warning',
-    };
-  }
+  const mins = Math.ceil(remainingMs / MINUTE_MS);
+  let left;
+  if (mins < 60) left = `${mins} min left`;
+  else if (mins < 24 * 60) left = `${Math.round(mins / 60)} hr left`;
+  else left = `${Math.round(mins / (60 * 24))} days left`;
 
-  if (remainingMs < 24 * HOUR_MS) {
-    const hours = Math.round(remainingMs / HOUR_MS);
-    return { label: `Collect within ${hours} hr`, urgency: 'normal' };
-  }
+  // Thresholds: under 15 min is act-now, 15-30 is decide-now, beyond that
+  // it's simply information.
+  let urgency = 'ok';
+  if (mins < 15) urgency = 'urgent';
+  else if (mins <= 30) urgency = 'warning';
 
-  const date = new Date(collectByTimestamp);
-  const timeLabel = date.toLocaleTimeString([], { hour: '2-digit', minute: '2-digit' });
-  return { label: `Collect by ${timeLabel}`, urgency: 'normal' };
+  // NOTE: only the END of the pickup window is stored (`collectByTimestamp`,
+  // set as now + collectMinutes when the merchant publishes). There is no
+  // start time anywhere in the schema, so "Pickup 6:00-7:00 PM" can't be
+  // shown without inventing one. "Pickup by 7:00 PM" is what the data
+  // actually supports.
+  return { label: `Pickup by ${endLabel} · ${left}`, urgency };
 }
+
 
 /** "5 min ago" / "2 hr ago" / "3d ago" style relative time from an epoch ms timestamp. */
 export function formatRelativeTime(timestampMs) {
@@ -51,3 +54,15 @@ export const COLLECT_BY_PRESETS = [
   { label: '2 hr', minutes: 120 },
   { label: '4 hr', minutes: 240 },
 ];
+
+/**
+ * Same data as formatCollectBy, split into its two halves so the Discover
+ * card can put the countdown on the photo and the clock time in the body.
+ */
+export function formatCollectByParts(collectByTimestamp) {
+  const { label, urgency } = formatCollectBy(collectByTimestamp);
+  if (!label) return { endLabel: null, leftLabel: null, urgency };
+  if (urgency === 'expired') return { endLabel: null, leftLabel: 'Closed', urgency };
+  const [byPart, leftPart] = label.split(' · ');
+  return { endLabel: byPart, leftLabel: leftPart, urgency };
+}

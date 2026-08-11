@@ -3,7 +3,7 @@ import React, { useState, useEffect } from 'react';
 import { Text, useTheme } from 'react-native-paper';
 import { formatCollectBy } from '../utils/time';
 
-const TICK_MS = 30000; // re-render every 30s so the countdown stays fresh
+const TICK_MS = 15000; // the label now counts minutes, so tick faster
 
 export default function CollectByBadge({ collectByTimestamp, size = 'bodySmall' }) {
   const theme = useTheme();
@@ -18,11 +18,12 @@ export default function CollectByBadge({ collectByTimestamp, size = 'bodySmall' 
   if (!label) return null;
 
   const color = {
+    ok: theme.colors.primary,
     normal: theme.colors.onSurfaceVariant,
     warning: theme.colors.secondary,
     urgent: theme.colors.error,
     expired: theme.colors.error,
-  }[urgency];
+  }[urgency] || theme.colors.onSurfaceVariant;
 
   const bold = urgency === 'urgent' || urgency === 'expired';
 

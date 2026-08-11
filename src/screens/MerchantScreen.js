@@ -7,7 +7,7 @@ import {
 } from 'react-native';
 import {
   Text, Button, Card, TextInput, Surface, ActivityIndicator,
-  Portal, Modal, Dialog, Avatar, useTheme, BottomNavigation, SegmentedButtons,
+  Portal, Modal, Dialog, Divider, Avatar, useTheme, BottomNavigation, SegmentedButtons,
 } from 'react-native-paper';
 import * as ImagePicker from 'expo-image-picker';
 import * as ImageManipulator from 'expo-image-manipulator';
@@ -29,7 +29,7 @@ import EarningsTab from '../components/EarningsTab';
 import HandoverQr from '../components/HandoverQr';
 import ReservationCard from '../components/ReservationCard';
 import {
-  classifyReservation, groupByDay, fulfilmentSummary, isResolvedState,
+  classifyReservation, groupByDay, fulfilmentSummary, isResolvedState, openCount,
 } from '../utils/reservations';
 import { sendPushNotification } from '../services/notificationService';
 import { getUserById } from '../services/authService';
@@ -604,7 +604,12 @@ function ReservationsTab({ theme }) {
         return (
           <View key={day.key}>
             <Text variant="titleMedium" style={styles.sectionTitle}>
-              {day.label} · {day.collected}/{day.total} collected
+              {day.label}
+            </Text>
+            <Text variant="bodySmall" style={{ color: theme.colors.onSurfaceVariant, marginBottom: 8 }}>
+              {openCount(day.items) > 0
+                ? `${openCount(day.items)} open · ${day.collected}/${day.total} collected`
+                : `${day.collected}/${day.total} collected`}
             </Text>
 
             {open.map((r) => (
@@ -646,6 +651,7 @@ function ReservationsTab({ theme }) {
                 ))}
               </>
             )}
+            <Divider style={{ marginTop: 4, marginBottom: 14 }} />
           </View>
         );
       })}

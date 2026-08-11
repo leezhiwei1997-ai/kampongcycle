@@ -1,15 +1,28 @@
 // src/components/SwipeDealCard.js
 import React, { useRef, useState } from 'react';
 import {
-  Animated, PanResponder, StyleSheet, View, Image, Dimensions, TouchableOpacity, Modal, ScrollView,
+  Animated, PanResponder, StyleSheet, View, Image, Dimensions, TouchableOpacity,
 } from 'react-native';
-import { Text, Card, useTheme } from 'react-native-paper';
+import {
+  Text, Card, Button, Divider, useTheme,
+} from 'react-native-paper';
 import StarRating from './StarRating';
-import CollectByBadge from './CollectByBadge';
+import ImageZoomViewer from './ImageZoomViewer';
+import { formatCollectByParts } from '../utils/time';
+import { withAlpha } from '../utils/color';
 
 const { width: SCREEN_WIDTH, height: SCREEN_HEIGHT } = Dimensions.get('window');
 const SWIPE_THRESHOLD = SCREEN_WIDTH * 0.28;
-const IMAGE_HEIGHT = Math.min(190, SCREEN_HEIGHT * 0.2);
+// The image area is a fixed 16:10 box, not a pixel height and not flex.
+//
+// flex:1 was the wrong tool: with the card also flexing, the image claimed
+// space the body needed and the two ended up drawn over each other. A ratio
+// is deterministic, scales with card width rather than screen height, and
+// behaves the same on every viewport — including Safari.
+const IMAGE_ASPECT = 16 / 10;
+
+// Stock is not a warning, so it gets a neutral slate rather than a status hue.
+const STOCK_COLOR = '#2d3436';
 
 export default function SwipeDealCard({
   deal, onSwipeRight, onSwipeLeft, isFollowing, onToggleFollow, followerCount, onShowReviews,
@@ -56,6 +69,14 @@ export default function SwipeDealCard({
     outputRange: ['-12deg', '0deg', '12deg'],
   });
 
+  const { endLabel, leftLabel, urgency } = formatCollectByParts(deal.collectByTimestamp);
+  const timeColor = {
+    ok: theme.colors.primary,
+    warning: theme.colors.secondary,
+    urgent: theme.colors.error,
+    expired: theme.colors.error,
+  }[urgency] || theme.colors.onSurfaceVariant;
+
   const likeOpacity = position.x.interpolate({
     inputRange: [20, SWIPE_THRESHOLD], outputRange: [0, 1], extrapolate: 'clamp',
   });
@@ -72,19 +93,43 @@ export default function SwipeDealCard({
       {...panResponder.panHandlers}
     >
       <Card style={styles.cardInner} mode="elevated">
-        {deal.image ? (
-          <TouchableOpacity
-            activeOpacity={0.9}
-            onPress={() => setZoomVisible(true)}
-            style={[styles.image, styles.imageFrame, { backgroundColor: theme.colors.primaryContainer }]}
-          >
-            <Image source={{ uri: deal.image }} style={styles.imageInner} resizeMode="contain" />
-          </TouchableOpacity>
-        ) : (
-          <View style={[styles.image, styles.imagePlaceholder, { backgroundColor: theme.colors.primaryContainer }]}>
-            <Text variant="displaySmall">🍲</Text>
+        <View style={styles.imageWrap}>
+          {deal.image ? (
+            <TouchableOpacity activeOpacity={0.9} onPress={() => setZoomVisible(true)} style={styles.imageFill}>
+              {/* "cover", not "contain". Letterboxing was what produced the
+                  coloured bars around portrait photos. A crop shows less of
+                  the picture but all of the card. */}
+              <Image source={{ uri: deal.image }} style={styles.image} resizeMode="cover" />
+            </TouchableOpacity>
+          ) : (
+            <View style={[styles.imageFill, styles.imagePlaceholder, { backgroundColor: theme.colors.surfaceVariant }]}>
+              <Text variant="displaySmall">🍲</Text>
+            </View>
+          )}
+
+          {/* Time pressure and scarcity ride on the photo, where they read
+              before anything else. Colour still comes from the urgency
+              thresholds, so "4 hr left" is green and "10 min left" is red. */}
+          <View style={styles.overlayColumn} pointerEvents="none">
+            {!!leftLabel && (
+              <View style={[styles.overlayPill, { borderColor: timeColor }]}>
+                <Text style={[styles.overlayText, { color: timeColor }]} numberOfLines={1}>
+                  ⏱ {leftLabel}
+                </Text>
+              </View>
+            )}
+            {typeof deal.quantity === 'number' && (
+              // Slate, never the urgency colour. Time and stock are different
+              // facts; when both pills were green they read as one block, and
+              // colour should mean exactly one thing here — how long you have.
+              <View style={[styles.overlayPill, { borderColor: STOCK_COLOR }]}>
+                <Text style={[styles.overlayText, { color: STOCK_COLOR }]} numberOfLines={1}>
+                  🍴 {deal.quantity} portion{deal.quantity === 1 ? '' : 's'} left
+                </Text>
+              </View>
+            )}
           </View>
-        )}
+        </View>
 
         <Animated.View style={[styles.badge, styles.likeBadge, { opacity: likeOpacity }]}>
           <Text style={[styles.badgeText, { color: theme.colors.primary }]}>RESERVE</Text>
@@ -93,40 +138,37 @@ export default function SwipeDealCard({
           <Text style={[styles.badgeText, { color: theme.colors.error }]}>SKIP</Text>
         </Animated.View>
 
-        {typeof onToggleFollow === 'function' && (
-          <TouchableOpacity
-            style={styles.followHeart}
-            onPress={() => onToggleFollow(deal)}
-            hitSlop={{
-              top: 10, bottom: 10, left: 10, right: 10,
-            }}
-          >
-            <Text style={{ fontSize: 26 }}>{isFollowing ? '❤️' : '🤍'}</Text>
-          </TouchableOpacity>
-        )}
-
         <Card.Content style={styles.content}>
-          <Text variant="titleLarge">{deal.item}</Text>
-          <View style={{ flexDirection: 'row', alignItems: 'center', justifyContent: 'space-between' }}>
-            <Text variant="bodyMedium" style={{ color: theme.colors.onSurfaceVariant }}>{deal.stall}</Text>
-            {typeof onToggleFollow === 'function' && (
-              <TouchableOpacity
-                onPress={() => onToggleFollow(deal)}
-                style={[
-                  styles.followTextButton,
-                  { borderColor: isFollowing ? theme.colors.error : theme.colors.outline },
-                ]}
+          <Text variant="headlineSmall" style={{ fontWeight: '700' }}>{deal.item}</Text>
+
+          <Text variant="bodyMedium" numberOfLines={1} style={{ color: theme.colors.onSurfaceVariant, marginTop: 2 }}>
+            {deal.stall}
+            {deal.distanceLabel ? ` · ${deal.distanceLabel}` : ''}
+          </Text>
+
+          <View style={styles.priceRow}>
+            <Text variant="displaySmall" style={{ color: theme.colors.primary, fontWeight: '800' }}>
+              {deal.price}
+            </Text>
+            {!!deal.originalPrice && (
+              <Text
+                variant="titleMedium"
+                style={{ textDecorationLine: 'line-through', color: theme.colors.outline, marginLeft: 10 }}
               >
-                <Text
-                  variant="labelSmall"
-                  style={{ color: isFollowing ? theme.colors.error : theme.colors.onSurfaceVariant, fontWeight: 'bold' }}
-                >
-                  {isFollowing ? '❤️ Following' : '🤍 Follow'}
-                </Text>
-              </TouchableOpacity>
+                {deal.originalPrice}
+              </Text>
             )}
           </View>
-          <View style={{ flexDirection: 'row', alignItems: 'center', marginTop: 4, flexWrap: 'wrap' }}>
+
+          {!!endLabel && (
+            <View style={[styles.pickupPill, { backgroundColor: withAlpha(timeColor, 0.14) }]}>
+              <Text style={{ color: timeColor, fontWeight: '600' }}>🕐 {endLabel}</Text>
+            </View>
+          )}
+
+          <Divider style={{ marginTop: 14 }} />
+
+          <View style={styles.socialRow}>
             {!!deal.merchantRating?.average && (
               <StarRating
                 value={deal.merchantRating.average}
@@ -135,116 +177,107 @@ export default function SwipeDealCard({
                 count={deal.merchantRating.count}
               />
             )}
-            {typeof followerCount === 'number' && followerCount > 0 && (
-              <Text variant="bodySmall" style={{ color: theme.colors.onSurfaceVariant, marginLeft: 8 }}>
-                ❤️ {followerCount} following
-              </Text>
-            )}
-            {typeof onShowReviews === 'function' && (
-              <TouchableOpacity onPress={() => onShowReviews(deal)}>
-                <Text variant="bodySmall" style={{ color: theme.colors.primary, marginLeft: 8, textDecorationLine: 'underline' }}>
-                  Reviews
+
+            {/* The heart moved off the photo and onto this row, where it sits
+                beside the number it changes. One control, one place. */}
+            {typeof onToggleFollow === 'function' && (
+              <TouchableOpacity
+                onPress={() => onToggleFollow(deal)}
+                style={styles.followInline}
+                hitSlop={{
+                  top: 10, bottom: 10, left: 10, right: 10,
+                }}
+              >
+                <Text style={{ fontSize: 16 }}>{isFollowing ? '❤️' : '🤍'}</Text>
+                <Text variant="bodySmall" style={{ color: theme.colors.onSurfaceVariant, marginLeft: 4 }}>
+                  {typeof followerCount === 'number' ? `${followerCount} following` : 'Follow'}
                 </Text>
               </TouchableOpacity>
             )}
+
+            {typeof onShowReviews === 'function' && (
+              <Button mode="text" compact onPress={() => onShowReviews(deal)} labelStyle={{ fontSize: 12 }}>
+                Reviews
+              </Button>
+            )}
           </View>
-          {!!deal.distanceLabel && (
-            <Text variant="bodySmall" style={{ color: theme.colors.onSurfaceVariant, marginTop: 2 }}>
-              📍 {deal.distanceLabel}
-            </Text>
-          )}
-          {typeof deal.quantity === 'number' && (
-            <Text variant="bodySmall" style={{ color: theme.colors.onSurfaceVariant, marginTop: 2 }}>
-              🍽️ {deal.quantity} portion{deal.quantity === 1 ? '' : 's'} left
-            </Text>
-          )}
-          {!!deal.collectByTimestamp && (
-            <View style={{ marginTop: 2 }}>
-              <CollectByBadge collectByTimestamp={deal.collectByTimestamp} />
-            </View>
-          )}
-          <Text variant="headlineSmall" style={{ color: theme.colors.secondary, fontWeight: 'bold', marginTop: 8 }}>
-            {deal.price}
-            {' '}
-            <Text style={{ textDecorationLine: 'line-through', color: theme.colors.outline, fontSize: 14 }}>
-              {deal.originalPrice}
-            </Text>
-          </Text>
+
+          {/* Buttons live inside the card now. They belong to this deal, and
+              the card is what swipes away when one is pressed. */}
+          <View style={styles.actionRow}>
+            <Button
+              mode="outlined"
+              onPress={onSwipeLeft}
+              style={styles.skipButton}
+              contentStyle={{ height: 48 }}
+              textColor={theme.colors.onSurfaceVariant}
+            >
+              Skip
+            </Button>
+            <Button
+              mode="contained"
+              onPress={() => onSwipeRight(deal)}
+              style={styles.reserveButton}
+              contentStyle={{ height: 48 }}
+              labelStyle={{ fontSize: 16, fontWeight: 'bold' }}
+            >
+              Reserve
+            </Button>
+          </View>
         </Card.Content>
       </Card>
 
-      {!!deal.image && (
-        <Modal visible={zoomVisible} transparent animationType="fade" onRequestClose={() => setZoomVisible(false)}>
-          <View style={styles.zoomOverlay}>
-            <TouchableOpacity
-              style={styles.zoomCloseButton}
-              onPress={() => setZoomVisible(false)}
-              hitSlop={{
-                top: 12, bottom: 12, left: 12, right: 12,
-              }}
-            >
-              <Text style={{ color: '#fff', fontSize: 20, fontWeight: 'bold' }}>✕ Close</Text>
-            </TouchableOpacity>
-            <ScrollView
-              style={{ flex: 1 }}
-              contentContainerStyle={styles.zoomScrollContent}
-              maximumZoomScale={4}
-              minimumZoomScale={1}
-              centerContent
-              bouncesZoom
-              showsVerticalScrollIndicator={false}
-              showsHorizontalScrollIndicator={false}
-            >
-              <Image source={{ uri: deal.image }} style={styles.zoomImage} resizeMode="contain" />
-            </ScrollView>
-            <Text style={styles.zoomHint}>Pinch to zoom in on labels or text</Text>
-          </View>
-        </Modal>
-      )}
+      <ImageZoomViewer
+        visible={zoomVisible}
+        uri={deal.image}
+        title={deal.item}
+        onDismiss={() => setZoomVisible(false)}
+      />
+
     </Animated.View>
   );
 }
 
 const styles = StyleSheet.create({
-  card: { position: 'absolute', width: SCREEN_WIDTH - 40, alignSelf: 'center' },
+  // Natural height — the card is as tall as its content and no taller. Not
+  // absolute (only one is ever mounted) and not flex (that let the image
+  // fight the body for space).
+  card: { width: SCREEN_WIDTH - 40, alignSelf: 'center' },
   cardInner: { borderRadius: 20, overflow: 'hidden' },
-  image: { width: '100%', height: IMAGE_HEIGHT },
-  imageFrame: { alignItems: 'center', justifyContent: 'center' },
-  imageInner: { width: '100%', height: '100%' },
+  image: { width: '100%', height: '100%' },
   imagePlaceholder: { alignItems: 'center', justifyContent: 'center' },
-  zoomOverlay: {
-    flex: 1, backgroundColor: 'rgba(0,0,0,0.92)', paddingTop: 50,
+  imageWrap: { width: '100%', aspectRatio: IMAGE_ASPECT },
+  imageFill: { width: '100%', height: '100%' },
+  content: { paddingVertical: 12 },
+  // Inset from the top-right corner, stacked with a gap so the two can never
+  // sit on top of each other. Near-opaque white behind coloured text: legible
+  // over any photo, unlike a translucent tint.
+  overlayColumn: {
+    position: 'absolute', top: 8, right: 8, alignItems: 'flex-end', gap: 6,
   },
-  zoomCloseButton: {
-    position: 'absolute', top: 50, right: 20, zIndex: 10,
-    backgroundColor: 'rgba(255,255,255,0.15)', borderRadius: 20, paddingHorizontal: 14, paddingVertical: 8,
+  overlayPill: {
+    paddingHorizontal: 10,
+    paddingVertical: 5,
+    borderRadius: 14,
+    borderWidth: 1,
+    backgroundColor: 'rgba(255,255,255,0.94)',
   },
-  zoomScrollContent: {
-    flexGrow: 1, alignItems: 'center', justifyContent: 'center',
+  overlayText: { fontSize: 12, fontWeight: '700' },
+  priceRow: { flexDirection: 'row', alignItems: 'baseline', marginTop: 10 },
+  pickupPill: {
+    alignSelf: 'flex-start', paddingHorizontal: 12, paddingVertical: 7, borderRadius: 16, marginTop: 10,
   },
-  zoomImage: { width: SCREEN_WIDTH, height: SCREEN_HEIGHT * 0.75 },
-  zoomHint: {
-    color: 'rgba(255,255,255,0.7)', textAlign: 'center', paddingVertical: 16, fontSize: 13,
+  socialRow: {
+    flexDirection: 'row', alignItems: 'center', marginTop: 12, flexWrap: 'wrap', gap: 12,
   },
-  followTextButton: {
-    borderWidth: 1, borderRadius: 12, paddingHorizontal: 10, paddingVertical: 4,
-  },
-  content: { paddingVertical: 10 },
+  followInline: { flexDirection: 'row', alignItems: 'center' },
+  actionRow: { flexDirection: 'row', alignItems: 'center', marginTop: 16 },
+  skipButton: { flex: 1, marginRight: 10, borderRadius: 24 },
+  reserveButton: { flex: 2, borderRadius: 24 },
   badge: {
     position: 'absolute', top: 20, padding: 8, borderWidth: 3, borderRadius: 8,
   },
   likeBadge: { left: 20, borderColor: '#2e7d32', transform: [{ rotate: '-15deg' }] },
   skipBadge: { right: 20, borderColor: '#ba1a1a', transform: [{ rotate: '15deg' }] },
   badgeText: { fontWeight: 'bold', fontSize: 18, letterSpacing: 1 },
-  followHeart: {
-    position: 'absolute',
-    top: 12,
-    right: 12,
-    backgroundColor: 'rgba(255,255,255,0.85)',
-    borderRadius: 20,
-    width: 40,
-    height: 40,
-    alignItems: 'center',
-    justifyContent: 'center',
-  },
 });
