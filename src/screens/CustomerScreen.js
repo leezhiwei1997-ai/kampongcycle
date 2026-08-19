@@ -18,23 +18,27 @@ import {
   getRatingStatsForMerchants, submitRating, fetchReservationsForCustomer,
   fetchFollowedMerchants, followStall, unfollowStall, getFollowerCountsForMerchants,
   getReviewsForMerchant, fetchFollowedStalls, confirmPickupByScan,
+  cancelReservationAsCustomer, raiseDisputeAsCustomer, reconcileCustomerNoShows,
+  setReservationNotes,
 } from '../services/appDataService';
 import { distanceKm, formatDistance } from '../utils/geo';
 import { formatRelativeTime } from '../utils/time';
-import { scheduleLocalNotification, sendPushNotification } from '../services/notificationService';
+import { scheduleLocalNotification } from '../services/notificationService';
 import { getUserByEmail } from '../services/authService';
+import { isInNoShowCooldown } from '../utils/permissions';
 import SwipeDealCard from '../components/SwipeDealCard';
 import ConfirmPickupScanner from '../components/ConfirmPickupScanner';
 import OrderCard from '../components/OrderCard';
 import MyOrdersSummary from '../components/MyOrdersSummary';
 import EcoBadge from '../components/EcoBadge';
 import ProfileStats from '../components/ProfileStats';
+import MessageThread from '../components/MessageThread';
 import { computeImpact, recentActivity } from '../utils/impact';
 import { statusTone } from '../utils/reservations';
 import { withAlpha } from '../utils/color';
 import {
   classifyReservation, STATUS_LABEL, canReview, reviewAvailableAt, canConfirmPickup,
-  groupByDay, isResolvedState, openCount,
+  groupByDay, isResolvedState, openCount, canCustomerReserve, canCustomerCancel, canCustomerDispute,
 } from '../utils/reservations';
 import StarRating from '../components/StarRating';
 import { useAuth } from '../context/AuthContext';
@@ -237,7 +241,26 @@ function DiscoverTab({ theme, stallFilter, onClearStallFilter }) {
   }, []);
 
   const handleSwipeRight = useCallback(async (deal) => {
+    if (isInNoShowCooldown(user)) {
+      Alert.alert(
+        'Reservations paused',
+        "You've missed a few pickups recently — reservations are paused on your account for a bit.",
+      );
+      setCardIndex((i) => i + 1);
+      return;
+    }
     try {
+      const myReservations = await fetchReservationsForCustomer(user.uid);
+      const check = canCustomerReserve(myReservations, deal.id);
+      if (!check.ok) {
+        Alert.alert('Could not reserve', check.reason);
+        setCardIndex((i) => i + 1);
+        return;
+      }
+
+      // Merchant/owner push notification is centralized in
+      // appDataService.reserveFoodDeal now — this stays local-only, the
+      // device-side "reservation confirmed" toast for the customer.
       await reserveFoodDeal(deal.id, deal, { uid: user.uid, name: user.name, email: user.email });
       // Deliberately NOT opening the rating modal here. At this point the
       // customer has reserved food they have not collected, let alone eaten
@@ -248,16 +271,6 @@ function DiscoverTab({ theme, stallFilter, onClearStallFilter }) {
         'Reservation confirmed! 🎉',
         `${deal.item} from ${deal.stall} — check My Orders for pickup details.`,
       );
-
-      getUserByEmail(deal.merchantEmail).then((merchant) => {
-        if (merchant?.pushToken) {
-          sendPushNotification(
-            merchant.pushToken,
-            'New reservation! 🍽️',
-            `${user.name} reserved ${deal.item}.`,
-          );
-        }
-      }).catch(() => {});
     } catch (err) {
       Alert.alert('Could not reserve', err.message || 'Please try again.');
     } finally {
@@ -527,6 +540,12 @@ function OrdersTab({ theme }) {
   const [comment, setComment] = useState('');
   const [isSubmitting, setIsSubmitting] = useState(false);
 
+  const [disputeTarget, setDisputeTarget] = useState(null);
+  const [disputeReason, setDisputeReason] = useState('');
+  const [notesTarget, setNotesTarget] = useState(null);
+  const [notesDraft, setNotesDraft] = useState('');
+  const [messageTarget, setMessageTarget] = useState(null);
+
   // Returns an error string to show inside the scanner, or null on success.
   const handleScan = useCallback(async (payload) => {
     try {
@@ -574,14 +593,27 @@ function OrdersTab({ theme }) {
 
   const load = useCallback(async () => {
     try {
-      setReservations(await fetchReservationsForCustomer(user.uid));
+      const rows = await fetchReservationsForCustomer(user.uid);
+      setReservations(rows);
+      // Self-reported bookkeeping — see appDataService.js's
+      // reconcileCustomerNoShows. Only the customer's OWN unreconciled
+      // expiries, so this can't double-count on repeated loads.
+      const unreconciled = rows.filter((r) => r.status === 'expired' && !r.noShowCounted);
+      if (unreconciled.length > 0) {
+        let running = user.noShowCount || 0;
+        await unreconciled.reduce(async (prev, r) => {
+          await prev;
+          await reconcileCustomerNoShows(r.id, user.uid, running).catch(() => {});
+          running += 1;
+        }, Promise.resolve());
+      }
     } catch (err) {
       Alert.alert('Could not load your orders', err.message || 'Please try again.');
     } finally {
       setIsLoading(false);
       setIsRefreshing(false);
     }
-  }, [user.uid]);
+  }, [user.uid, user.noShowCount]);
 
   useEffect(() => { load(); }, [load]);
 
@@ -589,6 +621,67 @@ function OrdersTab({ theme }) {
     setIsRefreshing(true);
     load();
   }, [load]);
+
+  const handleCancel = useCallback((r) => {
+    Alert.alert('Cancel this reservation?', 'The stall will be able to offer it to someone else.', [
+      { text: 'Keep it', style: 'cancel' },
+      {
+        text: 'Cancel reservation',
+        style: 'destructive',
+        onPress: async () => {
+          try {
+            await cancelReservationAsCustomer(r.id, r, user.uid);
+            setReservations((prev) => prev.map((x) => (x.id === r.id ? { ...x, status: 'cancelled' } : x)));
+          } catch (err) {
+            Alert.alert('Could not cancel', err.message || 'Please try again.');
+          }
+        },
+      },
+    ]);
+  }, [user.uid]);
+
+  const submitDispute = useCallback(async () => {
+    if (!disputeTarget || !disputeReason.trim()) return;
+    try {
+      await raiseDisputeAsCustomer(disputeTarget.id, user.uid, disputeReason);
+      setReservations((prev) => prev.map(
+        (x) => (x.id === disputeTarget.id ? { ...x, status: 'disputed' } : x),
+      ));
+      setDisputeTarget(null);
+      setDisputeReason('');
+    } catch (err) {
+      Alert.alert('Could not raise dispute', err.message || 'Please try again.');
+    }
+  }, [disputeTarget, disputeReason, user.uid]);
+
+  const openNotes = useCallback((r) => {
+    setNotesDraft(r.customerNotes || '');
+    setNotesTarget(r);
+  }, []);
+
+  const submitNotes = useCallback(async () => {
+    if (!notesTarget) return;
+    try {
+      await setReservationNotes(notesTarget.id, notesDraft);
+      setReservations((prev) => prev.map(
+        (x) => (x.id === notesTarget.id ? { ...x, customerNotes: notesDraft } : x),
+      ));
+      setNotesTarget(null);
+    } catch (err) {
+      Alert.alert('Could not save note', err.message || 'Please try again.');
+    }
+  }, [notesTarget, notesDraft]);
+
+  const openMessage = useCallback(async (r) => {
+    let notifyTarget = null;
+    try {
+      const merchant = await getUserByEmail(r.merchantEmail);
+      notifyTarget = merchant?.pushToken || null;
+    } catch {
+      // Best-effort — the thread still opens without push notification.
+    }
+    setMessageTarget({ reservation: r, notifyTarget });
+  }, []);
 
   // Orders are now grouped by day rather than split pending/collected — the
   // day header carries the collected count for that day.
@@ -646,6 +739,10 @@ function OrdersTab({ theme }) {
                 reservation={r}
                 onConfirm={() => setScanVisible(true)}
                 onReview={openReview}
+                onCancel={handleCancel}
+                onDispute={(x) => { setDisputeTarget(x); setDisputeReason(''); }}
+                onEditNotes={openNotes}
+                onMessage={openMessage}
               />
             ))}
 
@@ -665,6 +762,10 @@ function OrdersTab({ theme }) {
                     reservation={r}
                     onConfirm={() => setScanVisible(true)}
                     onReview={openReview}
+                    onCancel={handleCancel}
+                    onDispute={(x) => { setDisputeTarget(x); setDisputeReason(''); }}
+                    onEditNotes={openNotes}
+                    onMessage={openMessage}
                   />
                 ))}
               </>
@@ -679,6 +780,56 @@ function OrdersTab({ theme }) {
         onDismiss={() => setScanVisible(false)}
         onCode={handleScan}
       />
+
+      <MessageThread
+        visible={!!messageTarget}
+        onDismiss={() => setMessageTarget(null)}
+        reservationId={messageTarget?.reservation?.id}
+        currentUid={user.uid}
+        senderRole="customer"
+        item={messageTarget?.reservation?.item}
+        notifyTarget={messageTarget?.notifyTarget}
+      />
+
+      <Portal>
+        <Dialog visible={!!disputeTarget} onDismiss={() => setDisputeTarget(null)}>
+          <Dialog.Title>Something went wrong?</Dialog.Title>
+          <Dialog.Content>
+            <Text variant="bodySmall" style={{ marginBottom: 10 }}>
+              An admin will read this and decide. Say what happened.
+            </Text>
+            <TextInput
+              mode="outlined"
+              label="What happened"
+              value={disputeReason}
+              onChangeText={setDisputeReason}
+              multiline
+            />
+          </Dialog.Content>
+          <Dialog.Actions>
+            <Button onPress={() => setDisputeTarget(null)}>Cancel</Button>
+            <Button onPress={submitDispute} disabled={!disputeReason.trim()}>Submit</Button>
+          </Dialog.Actions>
+        </Dialog>
+
+        <Dialog visible={!!notesTarget} onDismiss={() => setNotesTarget(null)}>
+          <Dialog.Title>Note for the stall</Dialog.Title>
+          <Dialog.Content>
+            <TextInput
+              mode="outlined"
+              label="e.g. running 5 min late"
+              value={notesDraft}
+              onChangeText={setNotesDraft}
+              maxLength={200}
+              multiline
+            />
+          </Dialog.Content>
+          <Dialog.Actions>
+            <Button onPress={() => setNotesTarget(null)}>Cancel</Button>
+            <Button onPress={submitNotes}>Save</Button>
+          </Dialog.Actions>
+        </Dialog>
+      </Portal>
 
       <Portal>
         <Modal visible={!!reviewTarget} onDismiss={closeReview} contentContainerStyle={styles.ratingModal}>

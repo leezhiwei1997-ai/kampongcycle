@@ -21,6 +21,7 @@ import {
   getImpactStats, getMerchantRatingStats,
   fetchReservationsForMerchant, beginHandover, resolveReservation,
   getFollowerCount, getReviewsForMerchant,
+  attachStallCategories, autoExpireReservation, setMerchantStatus,
 } from '../services/appDataService';
 import StarRating from '../components/StarRating';
 import CollectByBadge from '../components/CollectByBadge';
@@ -28,20 +29,42 @@ import { splitListings, archiveReason, portionsLeft } from '../utils/listings';
 import EarningsTab from '../components/EarningsTab';
 import HandoverQr from '../components/HandoverQr';
 import ReservationCard from '../components/ReservationCard';
+import MessageThread from '../components/MessageThread';
+import StoreSetup from '../components/StoreSetup';
+import StaffManagement from '../components/StaffManagement';
 import {
   classifyReservation, groupByDay, fulfilmentSummary, isResolvedState, openCount,
 } from '../utils/reservations';
-import { sendPushNotification } from '../services/notificationService';
-import { getUserById } from '../services/authService';
+import { getUserById, listStalls, pickOwnStall } from '../services/authService';
+import {
+  isStaff, stallEmailFor, canViewEarnings, canManageStalls, canManageStaff,
+} from '../utils/permissions';
 import { useAuth } from '../context/AuthContext';
 
 const IMAGE_QUALITY = 0.3;
 
 function ListingsTab({ theme }) {
-  const { user, refreshUser } = useAuth();
+  const { user } = useAuth();
+  const staffMember = isStaff(user);
+  const stallEmail = stallEmailFor(user);
+  const ownerUid = staffMember ? user.assignedOwnerUid : user.uid;
+
+  // Staff carry no `verified` of their own (see isActiveStaff() in
+  // firestore.rules) — their publish permission depends on the OWNER's
+  // verification, fetched once here rather than trusting a stale value.
+  const [ownerVerified, setOwnerVerified] = useState(staffMember ? false : user.verified);
+  useEffect(() => {
+    if (!staffMember) { setOwnerVerified(user.verified); return; }
+    getUserById(user.assignedOwnerUid)
+      .then((owner) => setOwnerVerified(!!owner?.verified))
+      .catch(() => setOwnerVerified(false));
+  }, [staffMember, user.assignedOwnerUid, user.verified]);
+
   const [myDeals, setMyDeals] = useState([]);
   const [isLoadingDeals, setIsLoadingDeals] = useState(true);
   const [mealsSaved, setMealsSaved] = useState(null);
+  const [stalls, setStalls] = useState([]);
+  const [selectedStallId, setSelectedStallId] = useState(null);
 
   const [modalVisible, setModalVisible] = useState(false);
   const [editingDealId, setEditingDealId] = useState(null);
@@ -61,32 +84,50 @@ function ListingsTab({ theme }) {
 
   const loadMyDeals = useCallback(async () => {
     try {
-      setMyDeals(await fetchDealsForMerchant(user.email));
+      setMyDeals(await fetchDealsForMerchant(stallEmail));
     } catch (err) {
       Alert.alert('Could not load your listings', err.message || 'Please try again.');
     } finally {
       setIsLoadingDeals(false);
       setIsRefreshing(false);
     }
-  }, [user.email]);
+  }, [stallEmail]);
 
   const loadImpact = useCallback(async () => {
     try {
-      const stats = await getImpactStats(user.email);
+      const stats = await getImpactStats(stallEmail);
       setMealsSaved(stats.mealsSaved);
     } catch (err) {
       setMealsSaved(0);
     }
-  }, [user.email]);
+  }, [stallEmail]);
 
-  useEffect(() => { loadMyDeals(); loadImpact(); }, [loadMyDeals, loadImpact]);
+  const loadStalls = useCallback(async () => {
+    try {
+      const list = await listStalls(ownerUid);
+      setStalls(list);
+      setSelectedStallId((prev) => prev ?? (list[0]?.id || null));
+    } catch {
+      setStalls([]);
+    }
+  }, [ownerUid]);
+
+  useEffect(() => { loadMyDeals(); loadImpact(); loadStalls(); }, [loadMyDeals, loadImpact, loadStalls]);
 
   const handleRefresh = useCallback(() => {
     setIsRefreshing(true);
     loadMyDeals();
     loadImpact();
-    refreshUser();
-  }, [loadMyDeals, loadImpact, refreshUser]);
+    loadStalls();
+  }, [loadMyDeals, loadImpact, loadStalls]);
+
+  const handlePickOwnStall = useCallback(async (stallId) => {
+    try {
+      await pickOwnStall(user.uid, stallId);
+    } catch (err) {
+      Alert.alert('Could not set your stall', err.message || 'Please try again.');
+    }
+  }, [user.uid]);
 
   const runAiAnalysis = useCallback(async (base64) => {
     setIsAnalyzing(true);
@@ -110,10 +151,10 @@ function ListingsTab({ theme }) {
   }, []);
 
   const openNewListingModal = useCallback(async () => {
-    if (!user.verified) {
+    if (!ownerVerified) {
       Alert.alert(
         'Account pending verification',
-        'An admin needs to approve your merchant account before you can publish listings. Pull down to refresh once you\'ve been approved.',
+        'An admin needs to approve your stall owner\'s account before you can publish listings. Pull down to refresh once they\'ve been approved.',
       );
       return;
     }
@@ -154,7 +195,7 @@ function ListingsTab({ theme }) {
     } catch (err) {
       Alert.alert('Camera error', err.message || 'Could not open the camera. Please try again.');
     }
-  }, [runAiAnalysis, user.verified]);
+  }, [runAiAnalysis, ownerVerified]);
 
   const openEditModal = useCallback((deal) => {
     setEditingDealId(deal.id);
@@ -199,7 +240,7 @@ function ListingsTab({ theme }) {
         ? `data:image/jpeg;base64,${storedImageBase64}`
         : existingImage;
 
-      const payload = {
+      let payload = {
         stall: stallName.trim(),
         item: trimmedDish,
         price: toMoney(discountPrice),
@@ -207,8 +248,11 @@ function ListingsTab({ theme }) {
         image,
         quantity: qty,
         collectByTimestamp,
-        merchantEmail: user.email,
+        merchantEmail: stallEmail,
       };
+      if (selectedStallId) {
+        payload = await attachStallCategories(payload, ownerUid, selectedStallId);
+      }
 
       if (editingDealId) {
         await updateFoodDeal(editingDealId, payload);
@@ -241,7 +285,7 @@ function ListingsTab({ theme }) {
     }
   }, [
     dishName, stallName, discountPrice, originalPrice, quantity, collectMinutes,
-    storedImageBase64, existingImage, editingDealId, user.email, closeModal,
+    storedImageBase64, existingImage, editingDealId, stallEmail, ownerUid, selectedStallId, closeModal,
   ]);
 
   const handleRemoveDeal = useCallback((dealId) => {
@@ -278,16 +322,36 @@ function ListingsTab({ theme }) {
         <Text variant="bodySmall" style={styles.impactLabel}>meals saved from your stall 🌍</Text>
       </Surface>
 
-      {!user.verified && (
+      {!ownerVerified && (
         <Card style={[styles.aiCard, { backgroundColor: '#fff3cd' }]} mode="contained">
           <Card.Content style={{ alignItems: 'center' }}>
             <Text variant="titleMedium" style={{ fontWeight: 'bold', textAlign: 'center' }}>
               ⏳ Account pending verification
             </Text>
             <Text variant="bodySmall" style={{ color: theme.colors.onSurfaceVariant, textAlign: 'center', marginTop: 4 }}>
-              An admin needs to approve your merchant account before you can publish listings.
-              Pull down to refresh once you&apos;ve been approved.
+              An admin needs to approve your {staffMember ? "stall owner's" : ''} account before you can publish listings.
+              Pull down to refresh once {staffMember ? "they've" : "you've"} been approved.
             </Text>
+          </Card.Content>
+        </Card>
+      )}
+
+      {staffMember && !user.assignedStallId && stalls.length > 0 && (
+        <Card style={[styles.aiCard, { backgroundColor: '#e8f4fd' }]} mode="contained">
+          <Card.Content style={{ alignItems: 'center' }}>
+            <Text variant="titleMedium" style={{ fontWeight: 'bold', textAlign: 'center' }}>
+              Which stall do you work at?
+            </Text>
+            <Text variant="bodySmall" style={{ color: theme.colors.onSurfaceVariant, textAlign: 'center', marginTop: 4, marginBottom: 10 }}>
+              This is a one-time choice — an owner or admin can change it later.
+            </Text>
+            <View style={{ flexDirection: 'row', flexWrap: 'wrap', gap: 8, justifyContent: 'center' }}>
+              {stalls.map((s) => (
+                <Button key={s.id} mode="outlined" compact onPress={() => handlePickOwnStall(s.id)}>
+                  {s.stallName}
+                </Button>
+              ))}
+            </View>
           </Card.Content>
         </Card>
       )}
@@ -305,7 +369,7 @@ function ListingsTab({ theme }) {
             buttonColor={theme.colors.error}
             onPress={openNewListingModal}
             icon="camera"
-            disabled={!user.verified}
+            disabled={!ownerVerified}
           >
             Snap & List
           </Button>
@@ -400,6 +464,16 @@ function ListingsTab({ theme }) {
                 )}
                 <TextInput label="Dish Name" value={dishName} onChangeText={setDishName} mode="outlined" style={styles.input} />
                 <TextInput label="Stall Name" value={stallName} onChangeText={setStallName} mode="outlined" style={styles.input} />
+                {stalls.length > 1 && (
+                  <View style={{ marginBottom: 12 }}>
+                    <Text style={styles.label}>Which stall is this for?</Text>
+                    <SegmentedButtons
+                      value={selectedStallId || ''}
+                      onValueChange={setSelectedStallId}
+                      buttons={stalls.map((s) => ({ value: s.id, label: s.stallName }))}
+                    />
+                  </View>
+                )}
                 <View style={{ flexDirection: 'row', justifyContent: 'space-between' }}>
                   <TextInput
                     label="Discount ($)"
@@ -466,6 +540,8 @@ function ListingsTab({ theme }) {
 
 function ReservationsTab({ theme }) {
   const { user } = useAuth();
+  const staffMember = isStaff(user);
+  const stallEmail = stallEmailFor(user);
   const [reservations, setReservations] = useState([]);
   const [isLoading, setIsLoading] = useState(true);
   const [isRefreshing, setIsRefreshing] = useState(false);
@@ -473,17 +549,25 @@ function ReservationsTab({ theme }) {
   const [collapsed, setCollapsed] = useState({});
   const [dispute, setDispute] = useState(null);
   const [disputeReason, setDisputeReason] = useState('');
+  const [messageTarget, setMessageTarget] = useState(null);
 
   const load = useCallback(async () => {
     try {
-      setReservations(await fetchReservationsForMerchant(user.email));
+      const rows = await fetchReservationsForMerchant(stallEmail);
+      // Opportunistic sweep — no Cloud Functions in this app, so this runs
+      // from whichever stall member's device has the tab open. Best-effort:
+      // a failed sweep just leaves those rows 'pending' until the next load.
+      const expiredIds = await autoExpireReservation(rows, user.uid).catch(() => []);
+      setReservations(expiredIds.length
+        ? rows.map((r) => (expiredIds.includes(r.id) ? { ...r, status: 'expired' } : r))
+        : rows);
     } catch (err) {
       Alert.alert('Could not load reservations', err.message || 'Please try again.');
     } finally {
       setIsLoading(false);
       setIsRefreshing(false);
     }
-  }, [user.email]);
+  }, [stallEmail, user.uid]);
 
   useEffect(() => { load(); }, [load]);
 
@@ -541,6 +625,28 @@ function ReservationsTab({ theme }) {
       Alert.alert('Could not update', err.message || 'Please try again.');
     }
   }, [user.uid]);
+
+  const handleSetMerchantStatus = useCallback(async (reservationId, value) => {
+    try {
+      await setMerchantStatus(reservationId, value);
+      setReservations((prev) => prev.map(
+        (r) => (r.id === reservationId ? { ...r, merchantStatus: value } : r),
+      ));
+    } catch (err) {
+      Alert.alert('Could not update status', err.message || 'Please try again.');
+    }
+  }, []);
+
+  const handleOpenMessage = useCallback(async (r) => {
+    let notifyTarget = null;
+    try {
+      const customer = await getUserById(r.customerUid);
+      notifyTarget = customer?.pushToken || null;
+    } catch {
+      // Best-effort — the thread still opens without push notification.
+    }
+    setMessageTarget({ reservation: r, notifyTarget });
+  }, []);
 
   const submitDispute = useCallback(async () => {
     if (!dispute || !disputeReason.trim()) return;
@@ -626,6 +732,8 @@ function ReservationsTab({ theme }) {
                 })}
                 onResolve={handleResolve}
                 onDispute={(x) => { setDispute(x); setDisputeReason(''); }}
+                onSetMerchantStatus={handleSetMerchantStatus}
+                onMessage={handleOpenMessage}
               />
             ))}
 
@@ -647,6 +755,8 @@ function ReservationsTab({ theme }) {
                     onShowCode={() => {}}
                     onResolve={handleResolve}
                     onDispute={(x) => { setDispute(x); setDisputeReason(''); }}
+                    onSetMerchantStatus={handleSetMerchantStatus}
+                    onMessage={handleOpenMessage}
                   />
                 ))}
               </>
@@ -665,6 +775,16 @@ function ReservationsTab({ theme }) {
         issuedAt={handover?.issuedAt}
         item={handover?.item}
         onRefresh={handleRefreshQr}
+      />
+
+      <MessageThread
+        visible={!!messageTarget}
+        onDismiss={() => setMessageTarget(null)}
+        reservationId={messageTarget?.reservation?.id}
+        currentUid={user.uid}
+        senderRole={staffMember ? 'staff' : 'owner'}
+        item={messageTarget?.reservation?.item}
+        notifyTarget={messageTarget?.notifyTarget}
       />
 
       <Portal>
@@ -695,38 +815,47 @@ function ReservationsTab({ theme }) {
 
 function ProfileTab({ theme }) {
   const { user, logout } = useAuth();
+  const staffMember = isStaff(user);
+  const stallEmail = stallEmailFor(user);
+  const ownerUid = staffMember ? user.assignedOwnerUid : user.uid;
   const [ratingStats, setRatingStats] = useState(null);
   const [followerCount, setFollowerCount] = useState(null);
   const [reviews, setReviews] = useState([]);
   const [isLoadingReviews, setIsLoadingReviews] = useState(true);
+  const [storeSetupVisible, setStoreSetupVisible] = useState(false);
+  const [staffManagementVisible, setStaffManagementVisible] = useState(false);
 
   useEffect(() => {
-    getMerchantRatingStats(user.email)
+    getMerchantRatingStats(stallEmail)
       .then(setRatingStats)
       .catch(() => setRatingStats({ average: null, count: 0 }));
-    getFollowerCount(user.email)
+    getFollowerCount(stallEmail)
       .then(setFollowerCount)
       .catch(() => setFollowerCount(0));
-    getReviewsForMerchant(user.email)
+    getReviewsForMerchant(stallEmail)
       .then(setReviews)
       .catch(() => setReviews([]))
       .finally(() => setIsLoadingReviews(false));
-  }, [user.email]);
+  }, [stallEmail]);
 
   return (
     <ScrollView contentContainerStyle={[styles.tabContent, { alignItems: 'center', paddingTop: 40 }]}>
       <Avatar.Text size={80} label={user.name?.[0]?.toUpperCase() || '?'} style={{ backgroundColor: theme.colors.primary }} />
       <Text variant="titleLarge" style={{ marginTop: 12 }}>{user.name}</Text>
       <Text variant="bodyMedium" style={{ color: theme.colors.onSurfaceVariant }}>{user.email}</Text>
-      <Text variant="bodyMedium" style={{ color: theme.colors.onSurfaceVariant, marginTop: 2 }}>Merchant account</Text>
-      <Text
-        variant="bodySmall"
-        style={{
-          marginTop: 4, fontWeight: 'bold', color: user.verified ? theme.colors.primary : theme.colors.error,
-        }}
-      >
-        {user.verified ? '✓ Verified' : '⏳ Pending verification'}
+      <Text variant="bodyMedium" style={{ color: theme.colors.onSurfaceVariant, marginTop: 2 }}>
+        {staffMember ? `Staff at ${user.assignedOwnerEmail}` : 'Stall owner account'}
       </Text>
+      {!staffMember && (
+        <Text
+          variant="bodySmall"
+          style={{
+            marginTop: 4, fontWeight: 'bold', color: user.verified ? theme.colors.primary : theme.colors.error,
+          }}
+        >
+          {user.verified ? '✓ Verified' : '⏳ Pending verification'}
+        </Text>
+      )}
       {ratingStats && (
         <View style={{ marginTop: 12 }}>
           <StarRating value={ratingStats.average || 0} size={22} showCount count={ratingStats.count} />
@@ -764,6 +893,25 @@ function ProfileTab({ theme }) {
         )}
       </View>
 
+      {(canManageStalls(user) || canManageStaff(user)) && (
+        <View style={{ width: '100%', marginTop: 28 }}>
+          <Text variant="titleMedium" style={styles.sectionTitle}>Stall management</Text>
+          {canManageStalls(user) && (
+            <Button mode="outlined" icon="storefront" onPress={() => setStoreSetupVisible(true)} style={{ marginBottom: 10 }}>
+              Manage stalls
+            </Button>
+          )}
+          {canManageStaff(user) && (
+            <Button mode="outlined" icon="account-group" onPress={() => setStaffManagementVisible(true)}>
+              Your staff
+            </Button>
+          )}
+        </View>
+      )}
+
+      <StoreSetup visible={storeSetupVisible} onDismiss={() => setStoreSetupVisible(false)} ownerUid={ownerUid} />
+      <StaffManagement visible={staffManagementVisible} onDismiss={() => setStaffManagementVisible(false)} ownerUid={ownerUid} />
+
       <Button mode="contained" buttonColor={theme.colors.error} onPress={logout} style={{ marginTop: 24 }}>
         Log Out
       </Button>
@@ -785,7 +933,13 @@ export default function MerchantScreen() {
   const renderScene = BottomNavigation.SceneMap({
     listings: () => <ListingsTab theme={theme} />,
     reservations: () => <ReservationsTab theme={theme} />,
-    earnings: () => <EarningsTab />,
+    earnings: () => (canViewEarnings(user) ? <EarningsTab /> : (
+      <View style={[styles.tabContent, { alignItems: 'center', paddingTop: 60 }]}>
+        <Text variant="bodyMedium" style={{ color: theme.colors.onSurfaceVariant, textAlign: 'center' }}>
+          Earnings are only visible to the stall owner.
+        </Text>
+      </View>
+    )),
     profile: () => <ProfileTab theme={theme} />,
   });
 

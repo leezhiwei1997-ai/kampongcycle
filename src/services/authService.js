@@ -12,10 +12,11 @@ import {
   onAuthStateChanged,
 } from 'firebase/auth';
 import {
-  doc, setDoc, getDoc, getDocs, collection, updateDoc, query, where, limit,
-  onSnapshot,
+  doc, setDoc, getDoc, getDocs, addDoc, deleteDoc, collection, updateDoc, query, where, limit,
+  onSnapshot, serverTimestamp, increment,
 } from 'firebase/firestore';
 import { auth, db } from '../config/firebase';
+import { CURRENT_TERMS_VERSION } from '../utils/terms';
 
 function usersCollection() {
   return collection(db, 'users');
@@ -27,19 +28,47 @@ async function getUserProfile(uid) {
 }
 
 /**
- * role must be 'customer' or 'merchant'. Admin accounts are NOT
+ * role must be 'customer', 'owner', or 'staff'. Admin accounts are NOT
  * self-signed-up — create them by manually adding a `role: 'admin'`
  * field to a user's document in the Firestore console after they sign
  * up normally. This prevents anyone from granting themselves admin.
+ *
+ * Staff sign up under an existing owner by typing that owner's email
+ * (assignedOwnerEmail) — the only piece of identity a staff member
+ * unambiguously knows. It's resolved to assignedOwnerUid and validated
+ * BEFORE creating the Firebase Auth account, not after: the profile write
+ * happens second (same as before), and firestore.rules will reject a
+ * staff profile whose assignedOwnerUid doesn't point at a real role:'owner'
+ * account — checking that ourselves first avoids stranding an Auth-only
+ * account with no profile behind it over a typo'd owner email.
  */
 export async function signUp({
-  name, email, password, role,
+  name, email, password, role, agreedToTerms, assignedOwnerEmail,
 }) {
   if (!name?.trim() || !email?.trim() || !password) {
     throw new Error('Please fill in all fields.');
   }
-  if (role !== 'customer' && role !== 'merchant') {
+  if (!['customer', 'owner', 'staff'].includes(role)) {
     throw new Error('Please choose an account type.');
+  }
+  if (!agreedToTerms) {
+    throw new Error('Please agree to the terms to continue.');
+  }
+
+  let staffFields = {};
+  if (role === 'staff') {
+    const trimmedOwnerEmail = assignedOwnerEmail?.trim();
+    if (!trimmedOwnerEmail) {
+      throw new Error("Please enter your stall owner's email.");
+    }
+    const owner = await getUserByEmail(trimmedOwnerEmail);
+    if (!owner || owner.role !== 'owner') {
+      throw new Error("We couldn't find a stall owner with that email.");
+    }
+    staffFields = {
+      assignedOwnerUid: owner.uid,
+      assignedOwnerEmail: owner.email,
+    };
   }
 
   const credential = await createUserWithEmailAndPassword(auth, email.trim(), password);
@@ -48,14 +77,44 @@ export async function signUp({
     email: email.trim().toLowerCase(),
     role,
     // firestore.rules requires exactly this relationship on create:
-    //   verified == (role != 'merchant')
+    //   verified == (role != 'owner')   [for customer/owner]
+    //   verified == false               [for staff — the field is unused]
     // Omitting the field makes the rule comparison fail and the write
     // is rejected, leaving an Auth account with no profile document.
-    verified: role !== 'merchant',
+    verified: role === 'customer',
+    agreedToTerms: true,
+    termsVersion: CURRENT_TERMS_VERSION,
     createdAt: Date.now(),
+    ...staffFields,
   };
   await setDoc(doc(db, 'users', credential.user.uid), profile);
+  // Best-effort — a lost audit entry shouldn't block a successful signup.
+  await writeTermsAudit(credential.user.uid, CURRENT_TERMS_VERSION).catch(() => {});
   return { uid: credential.user.uid, ...profile };
+}
+
+/**
+ * Re-accept the current terms version (TermsGateModal, after a
+ * CURRENT_TERMS_VERSION bump). Self-service — matches firestore.rules'
+ * self-update rule, which allows agreedToTerms/termsVersion to move as
+ * long as the new version is a real non-empty string.
+ */
+export async function acceptTerms(uid) {
+  await updateDoc(doc(db, 'users', uid), {
+    agreedToTerms: true,
+    termsVersion: CURRENT_TERMS_VERSION,
+  });
+  await writeTermsAudit(uid, CURRENT_TERMS_VERSION).catch(() => {});
+}
+
+/** Append-only trail in users/{uid}/auditLog — mirrors appDataService.js's writeAudit. */
+export async function writeTermsAudit(uid, termsVersion) {
+  await addDoc(collection(db, 'users', uid, 'auditLog'), {
+    actor: uid,
+    action: 'terms_accepted',
+    termsVersion,
+    at: serverTimestamp(),
+  });
 }
 
 export async function logIn({ email, password }) {
@@ -180,4 +239,96 @@ export async function getUserByEmail(email) {
 /** Looks up a user's profile (including pushToken) by uid — used to notify a customer. */
 export async function getUserById(uid) {
   return getUserProfile(uid);
+}
+
+/** Admin-only: flip a pending owner account to verified. */
+export async function approveOwner(uid) {
+  await updateDoc(doc(db, 'users', uid), { verified: true });
+}
+
+/**
+ * Self-reported anti-griefing counter (see appDataService.js's
+ * reconcileCustomerNoShows, which calls this once per unresolved expiry).
+ * Never throws — a failed write here shouldn't block the customer's own
+ * screen from loading, same pattern as updatePushToken above.
+ *
+ * noShowCount only ever increases (enforced by firestore.rules too); every
+ * 3rd increment also pushes cooldownUntil a day forward, so an occasional
+ * miss doesn't cost anything but a pattern of them does.
+ */
+export async function incrementNoShowCount(uid, currentCount = 0) {
+  const nextCount = currentCount + 1;
+  const updates = { noShowCount: increment(1) };
+  if (nextCount % 3 === 0) {
+    updates.cooldownUntil = Date.now() + 24 * 60 * 60 * 1000;
+  }
+  try {
+    await updateDoc(doc(db, 'users', uid), updates);
+    return { success: true };
+  } catch (err) {
+    const code = err?.code || String(err);
+    console.warn(`[no-show] could not update counter for ${uid}: ${code}`);
+    return { success: false, error: code };
+  }
+}
+
+function stallsCollection(ownerUid) {
+  return collection(db, 'users', ownerUid, 'stalls');
+}
+
+/** Owner-only: add a stall. stallName is the only required field. */
+export async function createStall(ownerUid, data) {
+  const payload = {
+    stallName: data.stallName?.trim(),
+    hours: data.hours ?? null,
+    address: data.address ?? null,
+    gps: data.gps ?? null,
+    storefrontPhoto: data.storefrontPhoto ?? null,
+    categories: data.categories ?? [],
+    pausedUntil: null,
+    createdAt: Date.now(),
+  };
+  const ref = await addDoc(stallsCollection(ownerUid), payload);
+  return { id: ref.id, ...payload };
+}
+
+export async function listStalls(ownerUid) {
+  const snap = await getDocs(stallsCollection(ownerUid));
+  return snap.docs.map((d) => ({ id: d.id, ...d.data() }));
+}
+
+/**
+ * Owner or their staff (the caller decides which one — firestore.rules
+ * enforces the field-level split between them, see the stalls/{stallId}
+ * rules). Callers should only pass the fields they mean to change.
+ */
+export async function updateStall(ownerUid, stallId, updates) {
+  await updateDoc(doc(db, 'users', ownerUid, 'stalls', stallId), updates);
+}
+
+export async function deleteStall(ownerUid, stallId) {
+  await deleteDoc(doc(db, 'users', ownerUid, 'stalls', stallId));
+}
+
+/**
+ * Staff self-service: pick which of their owner's stalls they belong to,
+ * exactly once. firestore.rules only allows this self-update path when
+ * assignedStallId is currently null — after that it's admin/owner-only
+ * (see setStaffStall below).
+ */
+export async function pickOwnStall(staffUid, stallId) {
+  await updateDoc(doc(db, 'users', staffUid), { assignedStallId: stallId });
+}
+
+/** Owner-only: list staff currently assigned to them. */
+export async function listStaffForOwner(ownerUid) {
+  const snap = await getDocs(
+    query(usersCollection(), where('role', '==', 'staff'), where('assignedOwnerUid', '==', ownerUid)),
+  );
+  return snap.docs.map((d) => ({ uid: d.id, ...d.data() }));
+}
+
+/** Owner (or admin) reassigning/clearing which stall a staff member is linked to. */
+export async function setStaffStall(staffUid, stallId) {
+  await updateDoc(doc(db, 'users', staffUid), { assignedStallId: stallId ?? null });
 }

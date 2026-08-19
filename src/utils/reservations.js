@@ -4,16 +4,24 @@
 //
 // STORED statuses (what's in the document):
 //   'pending'             — reserved, not yet resolved
+//   'awaiting_handover'   — merchant started a handover, waiting on the customer
 //   'collected'           — customer picked it up
 //   'no_show'             — customer never came        (merchant attributed)
 //   'merchant_shortfall'  — stall couldn't fulfil it   (merchant attributed)
-//   'cancelled'           — called off before pickup
+//   'disputed'            — either side flagged it, waiting on an admin
+//   'cancelled'           — called off before pickup, by the customer
+//   'expired'             — a 'pending' reservation nobody acted on within
+//                            the grace period (see appDataService.js's
+//                            autoExpireReservation) — the pending-side
+//                            counterpart to 'unconfirmed' below.
 //
-// DERIVED state adds one more: a 'pending' reservation whose pickup window
-// has passed is 'needsReview'. It isn't written anywhere, because whose
-// fault it was is a human judgement — the app can tell that something went
-// wrong, but not who it went wrong for. So it surfaces the question and the
-// merchant answers it.
+// DERIVED state adds one more: a still-'pending' reservation whose pickup
+// window has passed, but the grace period hasn't yet, is 'needsReview' —
+// same label as 'expired' gets once it's actually written, since by the
+// time autoExpireReservation writes it the human-judgement question is the
+// same either way. Whose fault it was is a human judgement — the app can
+// tell that something went wrong, but not who it went wrong for. So it
+// surfaces the question and the merchant answers it.
 
 const DAY_MS = 24 * 60 * 60 * 1000;
 export const FALLBACK_WINDOW_MS = DAY_MS;
@@ -128,7 +136,7 @@ export function collectedMillis(r) {
   return null;
 }
 
-const CLOSED = ['collected', 'no_show', 'merchant_shortfall', 'cancelled', 'disputed'];
+const CLOSED = ['collected', 'no_show', 'merchant_shortfall', 'cancelled', 'disputed', 'expired'];
 
 /**
  * Can the merchant start a handover on this? Note what this is NOT: there is
@@ -177,6 +185,11 @@ export function classifyReservation(r, now = Date.now()) {
     case 'no_show': return 'noShow';
     case 'merchant_shortfall': return 'merchantFault';
     case 'disputed': return 'disputed';
+    // Written after the grace period by autoExpireReservation — same bucket
+    // a not-yet-swept-but-overdue 'pending' reservation already falls into
+    // below, so nothing downstream (STATUS_LABEL, fulfilmentSummary, ...)
+    // needs to know the difference between "overdue" and "swept overdue".
+    case 'expired': return 'needsReview';
     default: break;
   }
 
@@ -371,4 +384,41 @@ export function statusTone(state) {
 /** States the merchant has nothing left to do about. */
 export function isResolvedState(state) {
   return ['collected', 'noShow', 'merchantFault', 'cancelled', 'disputed'].includes(state);
+}
+
+/** A customer can cancel any time before a handover is actually confirmed. */
+export function canCustomerCancel(r) {
+  return ['pending', 'awaiting_handover'].includes(r?.status);
+}
+
+/**
+ * A customer can raise a dispute from almost any state — including after
+ * 'collected' ("I paid but didn't get what was promised") — the one thing
+ * that can't be re-disputed is a reservation that's already disputed or
+ * already cancelled. Mirrors firestore.rules' customer-dispute rule exactly.
+ */
+export function canCustomerDispute(r) {
+  return !['disputed', 'cancelled'].includes(r?.status);
+}
+
+const ACTIVE_STATUSES = ['pending', 'awaiting_handover'];
+
+/** Anti-griefing cap: at most 5 reservations open at once, one per deal. */
+export const MAX_ACTIVE_RESERVATIONS = 5;
+
+/**
+ * Client-side pre-check before calling reserveFoodDeal — best-effort only,
+ * same trust level as the rest of this app's anti-griefing measures (see
+ * firestore.rules' NOTE on this same cap: it can't be enforced server-side
+ * without a Cloud Function, which this app doesn't have).
+ */
+export function canCustomerReserve(reservations = [], dealId) {
+  const active = reservations.filter((r) => ACTIVE_STATUSES.includes(r?.status));
+  if (active.some((r) => r.dealId === dealId)) {
+    return { ok: false, reason: 'You already have an open reservation for this deal.' };
+  }
+  if (active.length >= MAX_ACTIVE_RESERVATIONS) {
+    return { ok: false, reason: `You can only have ${MAX_ACTIVE_RESERVATIONS} open reservations at once.` };
+  }
+  return { ok: true, reason: null };
 }

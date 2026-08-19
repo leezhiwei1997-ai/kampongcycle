@@ -12,55 +12,329 @@ service cloud.firestore {
         && get(/databases/$(database)/documents/users/$(request.auth.uid)).data.role == 'admin';
     }
 
-    function isVerifiedMerchant() {
+    function isVerifiedOwner() {
       return isSignedIn()
         && exists(/databases/$(database)/documents/users/$(request.auth.uid))
         && get(/databases/$(database)/documents/users/$(request.auth.uid)).data.verified == true;
     }
 
+    // Staff never carry verified:true on their own doc (see the users/{userId}
+    // create rule below) — their right to publish comes from the owner's
+    // stall they're assigned to, not from themselves. assignedOwnerUid is set
+    // once at signup and frozen after (see the update rule), so this can't be
+    // retargeted to a different owner later.
+    function isActiveStaff() {
+      return isSignedIn()
+        && exists(/databases/$(database)/documents/users/$(request.auth.uid))
+        && get(/databases/$(database)/documents/users/$(request.auth.uid)).data.role == 'staff'
+        && exists(/databases/$(database)/documents/users/$(get(/databases/$(database)/documents/users/$(request.auth.uid)).data.assignedOwnerUid))
+        && get(/databases/$(database)/documents/users/$(get(/databases/$(database)/documents/users/$(request.auth.uid)).data.assignedOwnerUid)).data.verified == true;
+    }
+
+    function canPublish() {
+      return isVerifiedOwner() || isActiveStaff();
+    }
+
+    // True for the stall's owner (their own token email matches stallEmail)
+    // or for staff assigned to that owner — this is what lets a staff
+    // account act on deals/reservations that are keyed by the OWNER's
+    // email, not their own.
+    //
+    // Every email comparison in this file goes through .lower().trim() —
+    // stored `email` fields are supposed to already be normalized that way
+    // (the app always writes them lowercased/trimmed), but a hand-typed
+    // Firestore console entry isn't guaranteed to be, and a single stray
+    // capital letter or trailing space there would silently fail every
+    // comparison against it. Normalizing at compare-time makes the rule
+    // robust to that instead of depending on every write path getting it
+    // exactly right.
+    function isStallMember(stallEmail) {
+      return isSignedIn()
+        && (request.auth.token.email.lower().trim() == stallEmail.lower().trim()
+            || (exists(/databases/$(database)/documents/users/$(request.auth.uid))
+                && get(/databases/$(database)/documents/users/$(request.auth.uid)).data.role == 'staff'
+                && exists(/databases/$(database)/documents/users/$(get(/databases/$(database)/documents/users/$(request.auth.uid)).data.assignedOwnerUid))
+                && get(/databases/$(database)/documents/users/$(get(/databases/$(database)/documents/users/$(request.auth.uid)).data.assignedOwnerUid)).data.email.lower().trim() == stallEmail.lower().trim()));
+    }
+
+    // For the NEW users/{ownerUid}/stalls/{stallId} subcollection only —
+    // separate from isStallMember() above on purpose. isStallMember() is
+    // the deals/reservations/messages gate and stays keyed by email, since
+    // nothing there reads stallId yet; this is scoped to stall documents
+    // themselves, keyed by the staff member's own assignedStallId field.
+    function isStaffOfStall(stallId) {
+      return isSignedIn()
+        && exists(/databases/$(database)/documents/users/$(request.auth.uid))
+        && get(/databases/$(database)/documents/users/$(request.auth.uid)).data.role == 'staff'
+        && get(/databases/$(database)/documents/users/$(request.auth.uid)).data.get('assignedStallId', null) == stallId;
+    }
+
     match /users/{userId} {
       allow read: if isSignedIn();
 
-      // Merchants start unverified; customers start (trivially) verified.
+      // Owners start unverified; customers start (trivially) verified.
       // Nobody can self-assign verified: true at signup.
+      //
+      // Staff are a separate branch: always created verified:false (their
+      // own `verified` field is unused — see isActiveStaff() above), and
+      // assignedOwnerUid must point at an existing role:'owner' account.
+      // assignedOwnerEmail is a denormalized convenience field for the
+      // client (so screens don't need an extra read to know which stall's
+      // email to query deals/reservations by); it's still verified here
+      // against the real owner doc so it can't be spoofed to point at a
+      // different email than assignedOwnerUid actually resolves to.
+      //
+      // .lower().trim() on both sides: the owner's stored email might have
+      // come from a hand-typed Firestore console entry rather than the
+      // app's own signup (e.g. after a manual data restore), so it isn't
+      // guaranteed to already be normalized the way the app's own writes
+      // are. Comparing normalized avoids rejecting a legitimate signup over
+      // a casing/whitespace difference that means nothing to a human.
+      // Terms acceptance is required at signup, for every role — no account
+      // gets created without it. The specific version string isn't checked
+      // here on purpose: which version counts as "current" is an app-level
+      // concept (src/utils/terms.js) that changes without needing a rules
+      // deploy, so this only validates the SHAPE (a real, non-empty
+      // version was recorded), not a hardcoded value.
       allow create: if isSignedIn()
                     && request.auth.uid == userId
-                    && request.resource.data.role in ['customer', 'merchant']
-                    && request.resource.data.verified == (request.resource.data.role != 'merchant');
+                    && request.resource.data.agreedToTerms == true
+                    && request.resource.data.termsVersion is string
+                    && request.resource.data.termsVersion.size() > 0
+                    && (
+                         (request.resource.data.role in ['customer', 'owner']
+                          && request.resource.data.verified == (request.resource.data.role != 'owner'))
+                         || (request.resource.data.role == 'staff'
+                             && request.resource.data.verified == false
+                             && exists(/databases/$(database)/documents/users/$(request.resource.data.assignedOwnerUid))
+                             && get(/databases/$(database)/documents/users/$(request.resource.data.assignedOwnerUid)).data.role == 'owner'
+                             && request.resource.data.assignedOwnerEmail.lower().trim()
+                                  == get(/databases/$(database)/documents/users/$(request.resource.data.assignedOwnerUid)).data.email.lower().trim()
+                             // assignedStallId is optional (most owners still have zero or
+                             // one stall in the new subcollection, and there's no staff-side
+                             // "pick a stall" UI yet) — but if it's present, it must be a
+                             // real stall that actually belongs to this assignedOwnerUid, so
+                             // staff can't claim membership in a stall they were never linked to.
+                             && (!('assignedStallId' in request.resource.data)
+                                 || exists(/databases/$(database)/documents/users/$(request.resource.data.assignedOwnerUid)/stalls/$(request.resource.data.assignedStallId))))
+                       );
 
-      // A user editing their own profile can't touch role or verified —
-      // those are admin-controlled below.
+      // A user editing their own profile can't touch role, verified, or
+      // which owner they're assigned to — those are admin/signup-controlled,
+      // not self-service.
+      //
+      // assignedStallId gets ONE exception: a staff account with no stall
+      // yet (signup couldn't tell which of the owner's stalls, because
+      // there was more than one) can self-service pick it exactly once —
+      // see pickOwnStall() in authService.js and the in-app prompt in
+      // MerchantScreen.js. Once set, it's frozen the same as everything
+      // else here; only an admin can change it after that (see the
+      // dedicated admin rule below).
+      //
+      // Re-accepting terms IS self-service too (see TermsGateModal), so
+      // that only steps in when agreedToTerms is actually part of the
+      // write, and mirrors the same shape check the create rule uses — a
+      // real, non-empty version, and never a self-authored "false".
+      // role/verified use .get(key, default) rather than direct field
+      // access — an account whose doc predates one of these fields (e.g.
+      // hand-created in the console before this app tracked it) would
+      // otherwise throw on direct access, which silently denies the ENTIRE
+      // rule and blocks every self-update to that account forever, not
+      // just a write that actually touches the missing field. This is
+      // exactly what broke self-service terms re-acceptance for an older
+      // admin account.
       allow update: if isSignedIn()
                     && request.auth.uid == userId
-                    && request.resource.data.role == resource.data.role
-                    && request.resource.data.verified == resource.data.verified;
+                    && request.resource.data.get('role', null) == resource.data.get('role', null)
+                    && request.resource.data.get('verified', null) == resource.data.get('verified', null)
+                    && request.resource.data.get('assignedOwnerUid', null) == resource.data.get('assignedOwnerUid', null)
+                    && (request.resource.data.get('assignedStallId', null) == resource.data.get('assignedStallId', null)
+                        || (resource.data.get('assignedStallId', null) == null
+                            && resource.data.role == 'staff'
+                            && request.resource.data.assignedStallId is string
+                            && exists(/databases/$(database)/documents/users/$(resource.data.assignedOwnerUid)/stalls/$(request.resource.data.assignedStallId))))
+                    && (!('agreedToTerms' in request.resource.data.diff(resource.data).affectedKeys())
+                        || (request.resource.data.agreedToTerms == true
+                            && request.resource.data.termsVersion is string
+                            && request.resource.data.termsVersion.size() > 0))
+                    // Anti-griefing counters (appDataService.js's
+                    // incrementNoShowCount) — self-written by the account
+                    // itself like everything else this rule governs, which
+                    // means self-reported (see that function's comment).
+                    // These two clauses don't stop someone skipping the
+                    // write entirely, but they DO stop the cheaper attack:
+                    // an account clearing its own noShowCount or
+                    // cooldownUntil back down through this same self-update
+                    // path. Neither field may ever move backward here.
+                    && request.resource.data.get('noShowCount', 0) >= resource.data.get('noShowCount', 0)
+                    && request.resource.data.get('cooldownUntil', 0) >= resource.data.get('cooldownUntil', 0);
 
       // Only an admin can flip verified, and only that one field.
       allow update: if isAdmin()
                     && request.resource.data.diff(resource.data).affectedKeys().hasOnly(['verified']);
 
+      // Only an admin can reassign role, and only that one field — e.g.
+      // fixing an account stuck on a legacy role value ('merchant', from
+      // before roles split into owner/staff), or one with NO role field at
+      // all (hand-created in the console before role was tracked — exactly
+      // the kind of account this rule exists to repair, so it has to
+      // tolerate the field being completely absent, not just wrong; hence
+      // .get(key, null) rather than direct access), or correcting a wrong
+      // pick at signup. Deliberately can't touch admin accounts in either
+      // direction: resource.data.role != 'admin' means an existing admin
+      // can't be reassigned away from here, and the target role list
+      // excludes 'admin' so nobody can be promoted into it from the app.
+      // Both stay console-only, same as they always were.
+      allow update: if isAdmin()
+                    && resource.data.get('role', null) != 'admin'
+                    && request.resource.data.role in ['customer', 'owner', 'staff']
+                    && request.resource.data.diff(resource.data).affectedKeys().hasOnly(['role']);
+
+      // Only an admin can assign/reassign which of the owner's stalls a
+      // staff account is linked to, and only that one field. Staff can
+      // self-service pick theirs once (see the self-update rule above),
+      // but after that — or to fix a wrong pick, or move staff to a
+      // different stall — it's admin-only. null clears the assignment
+      // back to unscoped (the pre-multi-stall behaviour).
+      allow update: if isAdmin()
+                    && resource.data.role == 'staff'
+                    && request.resource.data.diff(resource.data).affectedKeys().hasOnly(['assignedStallId'])
+                    && (request.resource.data.assignedStallId == null
+                        || exists(/databases/$(database)/documents/users/$(resource.data.assignedOwnerUid)/stalls/$(request.resource.data.assignedStallId)));
+
+      // Same power as the admin rule above, but for the OWNER managing
+      // their OWN staff (MerchantScreen.js's "Your staff" section) rather
+      // than an admin managing anyone's. resource.data.assignedOwnerUid ==
+      // request.auth.uid is what scopes it — an owner can only touch
+      // staff actually linked to them, never someone else's.
+      allow update: if isSignedIn()
+                    && resource.data.role == 'staff'
+                    && resource.data.get('assignedOwnerUid', null) == request.auth.uid
+                    && request.resource.data.diff(resource.data).affectedKeys().hasOnly(['assignedStallId'])
+                    && (request.resource.data.assignedStallId == null
+                        || exists(/databases/$(database)/documents/users/$(request.auth.uid)/stalls/$(request.resource.data.assignedStallId)));
+
       allow delete: if false;
+
+      // NOTE (future): once earnings/bank data moves into Firestore, e.g.
+      // users/{ownerUid}/earnings/{...} or users/{ownerUid}/bank/{...}, gate
+      // those subcollections so only the owning owner can read them — never
+      // staff, even active ones:
+      //   allow read: if isSignedIn()
+      //               && request.auth.uid == ownerUid
+      //               && get(/databases/$(database)/documents/users/$(request.auth.uid)).data.role == 'owner';
+      // canViewEarnings()/canEditBank() in src/utils/permissions.js already
+      // encode this client-side; this is the server-side mirror to add when
+      // that data model ships.
+
+      // Multi-stall model (additive) — one owner can have several of
+      // these. deals/reservations/etc. stay keyed by merchantEmail, so
+      // this doesn't touch any existing query or rule above.
+      match /stalls/{stallId} {
+        // Public storefront data — name, hours, address, photo, and (as of
+        // the category filter) categories — same sensitivity as the
+        // legacy fields on the top-level user doc, which is already
+        // readable by any signed-in user (see the users/{userId} read
+        // rule at the top of this file). Open to any signed-in user, not
+        // just the owner/their staff/admin, because
+        // appDataService.js's attachStallCategories() needs a CUSTOMER
+        // browsing Discover to be able to read a stall's categories —
+        // there's no way to grant that for just one field, Firestore
+        // rules are whole-document.
+        allow read: if isSignedIn();
+
+        // Owner only, and only the owner — staff don't create stalls.
+        // No uniqueness check here: isStallNameTaken() in
+        // src/utils/permissions.js is a client-side pre-check
+        // (StoreSetup.js calls it before writing); a real server-side
+        // "no sibling doc has this name" constraint would need a
+        // collection-wide read rules can't cheaply do without a backend
+        // function, so a name collision is prevented by the UI, not
+        // enforced here.
+        allow create: if isSignedIn()
+                      && request.auth.uid == userId
+                      && request.resource.data.stallName is string
+                      && request.resource.data.stallName.size() > 0;
+
+        // The owner can edit or delete any of their own stalls, full stop.
+        allow update, delete: if isSignedIn() && request.auth.uid == userId;
+
+        // Staff assigned to THIS specific stall (isStaffOfStall — narrower
+        // than "any signed-in user" the read rule above allows) can edit
+        // it too, via StallEditorForm.js / authService.js's updateStall()
+        // — but only the fields that form actually writes, never
+        // migratedFrom, createdAt, hawkerCenter or pickupWindowMinutes,
+        // and never delete the doc outright.
+        allow update: if isSignedIn() && isStaffOfStall(stallId)
+                      && request.resource.data.diff(resource.data).affectedKeys()
+                           .hasOnly(['stallName', 'hours', 'pausedUntil', 'address', 'gps', 'storefrontPhoto', 'categories'])
+                      && (!('stallName' in request.resource.data.diff(resource.data).affectedKeys())
+                          || (request.resource.data.stallName is string && request.resource.data.stallName.size() > 0));
+      }
+
+      // Terms-of-service acceptance trail (authService.js's
+      // writeTermsAudit) — same append-only shape as reservations'
+      // auditLog above, but scoped to THIS user's own subcollection rather
+      // than a shared one: only the account owner can write or read it,
+      // and only as themselves. Not a general-purpose activity log —
+      // action is locked to 'terms_accepted' so this can't grow into one.
+      match /auditLog/{entryId} {
+        allow read: if isSignedIn() && request.auth.uid == userId;
+        allow create: if isSignedIn()
+                      && request.auth.uid == userId
+                      && request.resource.data.actor == userId
+                      && request.resource.data.action == 'terms_accepted';
+        allow update, delete: if false;
+      }
     }
 
     match /deals/{dealId} {
       allow read: if isSignedIn();
       allow create: if isSignedIn()
-                    && request.resource.data.merchantEmail == request.auth.token.email
-                    && isVerifiedMerchant();
+                    && isStallMember(request.resource.data.merchantEmail)
+                    && canPublish();
 
-      // The merchant who owns the listing can edit anything about it.
+      // Anyone on the stall (owner or their staff) can edit anything about
+      // the listing.
       allow update: if isSignedIn()
-                    && resource.data.merchantEmail == request.auth.token.email;
+                    && isStallMember(resource.data.merchantEmail);
 
-      // A customer reserving a portion: quantity must drop by exactly 1,
-      // and nothing else about the listing may change in that request.
-      // The >= 0 floor is new — the client guards against reserving a
-      // sold-out listing, but a client guard isn't a guarantee, and without
-      // this a listing could be driven negative.
+      // SOFT RESERVE (see appDataService.js's reserveFoodDeal/beginHandover):
+      // reserving no longer touches quantity at all — a merchant decrements
+      // it here, at the moment they actually commit a physical portion to a
+      // specific customer (beginHandover), not when a customer merely
+      // claims one. Open to any signed-in user rather than scoped to
+      // isStallMember, same trust level this rule always had: quantity must
+      // drop by exactly 1, nothing else about the listing may change, and
+      // the >= 0 floor stops it going negative.
       allow update: if isSignedIn()
                     && request.resource.data.diff(resource.data).affectedKeys().hasOnly(['quantity'])
                     && request.resource.data.quantity == resource.data.quantity - 1
                     && request.resource.data.quantity >= 0;
+
+      // A customer relisting a portion they can no longer use — cancelling
+      // a reservation after a handover had already started decremented
+      // this (see the rule above), so cancelling it needs to give that
+      // portion back (appDataService.js's cancelReservationAsCustomer).
+      // Same open trust level as the decrement rule above, not scoped to
+      // "this signed-in user actually held that reservation" — a
+      // determined bad actor could inflate someone else's listing by 1;
+      // the worst outcome is an inventory-accuracy nuisance, not a
+      // security or payment issue (this app moves no money — see
+      // resolveDispute's comment).
+      allow update: if isSignedIn()
+                    && request.resource.data.diff(resource.data).affectedKeys().hasOnly(['quantity'])
+                    && request.resource.data.quantity == resource.data.quantity + 1;
+
+      // NOTE (anti-griefing, best-effort): the active-reservation cap (max
+      // 5 per customer) and one-reservation-per-deal rule are enforced
+      // client-side only (see utils/reservations.js's canCustomerReserve) —
+      // neither is checked here. A real server-side cap would need to read
+      // every OTHER reservation a customer holds while validating this
+      // create, which rules can't do cheaply (no queries inside rules,
+      // only exact-path get()/exists()); it would need a Cloud Function.
+      // This app has none — see reserveFoodDeal's comment for the same
+      // trade-off already accepted for inventory itself.
 
       // CHANGED: the old rule also allowed deletion by anyone when
       // `resource.data.quantity <= 1`. That existed so a customer taking the
@@ -69,8 +343,7 @@ service cloud.firestore {
       // that clause is now pure vandalism surface: any signed-in customer
       // could destroy any merchant's last-portion listing. Removed.
       allow delete: if isSignedIn()
-                    && (resource.data.merchantEmail == request.auth.token.email
-                        || isAdmin());
+                    && (isStallMember(resource.data.merchantEmail) || isAdmin());
     }
 
     match /reservations/{reservationId} {
@@ -87,19 +360,108 @@ service cloud.firestore {
       // enforcement; the UI merely reflects it.
       // ---------------------------------------------------------------
 
-      // MERCHANT: start a handover, or account for one that didn't happen.
-      // Note 'collected' is absent from this list, deliberately.
+      // OWNER OR THEIR STAFF: start a handover, or account for one that
+      // didn't happen. Note 'collected' is absent from this list,
+      // deliberately. 'expired' is included here too: the auto-expire sweep
+      // (appDataService.js's autoExpireReservation) has no Cloud Function /
+      // service-account identity to write as, so it runs as whatever stall
+      // member's device happens to have the Reservations tab open — same
+      // membership check as every other merchant-attributed write on this
+      // reservation.
       allow update: if isSignedIn()
-                    && resource.data.merchantEmail == request.auth.token.email
+                    && isStallMember(resource.data.merchantEmail)
+                    // Once a dispute exists — merchant-raised or customer-raised —
+                    // this rule can no longer touch the document at all. Without
+                    // this, a merchant could silently overwrite or erase a
+                    // customer's dispute (self-resolve it to 'no_show', or
+                    // rewrite disputeReason/disputedBy to their own account)
+                    // before an admin ever sees it, defeating the entire point
+                    // of the customer's independent dispute rule below. From
+                    // here on, only the admin resolution rule can move it.
+                    && resource.data.status != 'disputed'
                     && request.resource.data.diff(resource.data).affectedKeys()
-                         .hasOnly(['status', 'resolvedAt', 'handoverNonce',
-                                   'handoverExpiresAt', 'disputeReason'])
+                         .hasOnly(['status', 'resolvedAt', 'handoverNonce', 'handoverExpiresAt',
+                                   'disputeReason', 'disputedBy', 'handledByUid'])
                     && request.resource.data.status in
-                         ['awaiting_handover', 'no_show', 'merchant_shortfall', 'disputed']
+                         ['awaiting_handover', 'no_show', 'merchant_shortfall', 'disputed', 'expired']
+                    // A handover can only START from 'pending', or be
+                    // RE-started from 'awaiting_handover' itself — the
+                    // "Refresh" QR re-issue in MerchantScreen.js's
+                    // handleRefreshQr calls beginHandover again on a
+                    // reservation that's already awaiting_handover, so that
+                    // self-transition has to stay legal. Everything else —
+                    // 'cancelled', 'collected', 'expired' — is excluded, so
+                    // a merchant can no longer tap Hand over on a
+                    // reservation the customer already cancelled or that
+                    // was already collected/expired. 'disputed' is already
+                    // excluded above.
+                    && (request.resource.data.status != 'awaiting_handover'
+                        || resource.data.status in ['pending', 'awaiting_handover'])
                     && (request.resource.data.status != 'awaiting_handover'
                         || !('collectByTimestamp' in resource.data)
                         || resource.data.collectByTimestamp == null
-                        || request.time.toMillis() <= resource.data.collectByTimestamp + 7200000);
+                        || request.time.toMillis() <= resource.data.collectByTimestamp + 7200000)
+                    && (request.resource.data.status != 'expired' || resource.data.status == 'pending')
+                    && (request.resource.data.status != 'disputed' || request.resource.data.disputedBy == 'merchant');
+
+      // OWNER OR THEIR STAFF: set the one-tap kitchen-progress label shown
+      // to the customer (Preparing / Ready at Counter / Completed). Kept as
+      // its own rule, touching ONLY merchantStatus, so it can never be
+      // combined into a write that also sets `status` — merchantStatus is
+      // purely informational and must never be usable as a path to a fake
+      // 'collected' (see the customer-only rule right below).
+      allow update: if isSignedIn()
+                    && isStallMember(resource.data.merchantEmail)
+                    && request.resource.data.diff(resource.data).affectedKeys().hasOnly(['merchantStatus'])
+                    && request.resource.data.merchantStatus in ['preparing', 'ready', 'completed'];
+
+      // CUSTOMER: an optional note for the stall (appDataService.js's
+      // setReservationNotes) — separate from the messages/ thread below,
+      // this is a single field on the reservation itself, editable any
+      // time, not gated to a particular status.
+      allow update: if isSignedIn()
+                    && resource.data.customerUid == request.auth.uid
+                    && request.resource.data.diff(resource.data).affectedKeys().hasOnly(['customerNotes'])
+                    && request.resource.data.customerNotes is string
+                    && request.resource.data.customerNotes.size() <= 200;
+
+      // CUSTOMER: "Something went wrong" — the customer's own dispute
+      // trigger (appDataService.js's raiseDisputeAsCustomer), mirroring the
+      // merchant's above. Blocked once the reservation is already disputed
+      // or cancelled, so this can't be used to re-open a settled dispute.
+      allow update: if isSignedIn()
+                    && resource.data.customerUid == request.auth.uid
+                    && request.resource.data.diff(resource.data).affectedKeys()
+                         .hasOnly(['status', 'resolvedAt', 'disputeReason', 'disputedBy'])
+                    && request.resource.data.status == 'disputed'
+                    && !(resource.data.status in ['disputed', 'cancelled'])
+                    && request.resource.data.disputedBy == 'customer'
+                    && request.resource.data.disputeReason is string
+                    && request.resource.data.disputeReason.size() > 0;
+
+      // CUSTOMER: cancel their own reservation before it's collected
+      // (appDataService.js's cancelReservationAsCustomer) — anti-griefing
+      // recourse, available up to the point of collection so a mass-tap or
+      // change of mind doesn't have to sit out the full pickup window.
+      // Only from 'pending' or 'awaiting_handover', so this can't reopen or
+      // override anything already resolved (collected, disputed, no-show,
+      // shortfall, expired, or already cancelled).
+      allow update: if isSignedIn()
+                    && resource.data.customerUid == request.auth.uid
+                    && request.resource.data.diff(resource.data).affectedKeys().hasOnly(['status', 'resolvedAt'])
+                    && request.resource.data.status == 'cancelled'
+                    && resource.data.status in ['pending', 'awaiting_handover'];
+
+      // CUSTOMER: marks one of their OWN expired reservations as already
+      // counted toward noShowCount (appDataService.js's
+      // reconcileCustomerNoShows) — pure idempotency bookkeeping, not a
+      // lifecycle transition, so it's its own narrow rule rather than
+      // folded into any status-changing one above.
+      allow update: if isSignedIn()
+                    && resource.data.customerUid == request.auth.uid
+                    && request.resource.data.diff(resource.data).affectedKeys().hasOnly(['noShowCounted'])
+                    && request.resource.data.noShowCounted == true
+                    && resource.data.status == 'expired';
 
       // CUSTOMER: confirm receipt. Four conditions, all required:
       //   1. it's their own reservation
@@ -122,11 +484,15 @@ service cloud.firestore {
                     && request.resource.data.scannedNonce == resource.data.handoverNonce
                     && request.time.toMillis() <= resource.data.handoverExpiresAt;
 
-      // ADMIN: settle a dispute.
+      // ADMIN: settle a dispute. refundAgreedOffline is optional — see
+      // resolveDispute's comment (appDataService.js) for why this app moves
+      // no money at all (v1/beta payment model is cash/PayNow directly to
+      // the hawker) and this field is only ever an admin's note-to-self,
+      // never proof a refund actually happened.
       allow update: if isAdmin()
                     && resource.data.status == 'disputed'
                     && request.resource.data.diff(resource.data).affectedKeys()
-                         .hasOnly(['status', 'resolvedAt'])
+                         .hasOnly(['status', 'resolvedAt', 'refundAgreedOffline'])
                     && request.resource.data.status in
                          ['collected', 'no_show', 'merchant_shortfall'];
 
@@ -139,6 +505,27 @@ service cloud.firestore {
         allow read: if isSignedIn();
         allow create: if isSignedIn()
                       && request.resource.data.actor == request.auth.uid;
+        allow update, delete: if false;
+      }
+
+      // Per-reservation quick messages ("Still available?" / "Running 5 min
+      // late") — the in-app substitute for texting a stall's WhatsApp. Only
+      // the two parties on THIS reservation can read or write: the customer
+      // who made it, or anyone on the stall that owns it (owner or their
+      // staff, via isStallMember). Append-only, like auditLog — a thread
+      // either side could edit after the fact isn't trustworthy.
+      match /messages/{messageId} {
+        allow read: if isSignedIn()
+                    && (get(/databases/$(database)/documents/reservations/$(reservationId)).data.customerUid == request.auth.uid
+                        || isStallMember(get(/databases/$(database)/documents/reservations/$(reservationId)).data.merchantEmail));
+        allow create: if isSignedIn()
+                      && request.resource.data.senderUid == request.auth.uid
+                      && request.resource.data.senderRole in ['customer', 'owner', 'staff']
+                      && request.resource.data.text is string
+                      && request.resource.data.text.size() > 0
+                      && request.resource.data.text.size() <= 200
+                      && (get(/databases/$(database)/documents/reservations/$(reservationId)).data.customerUid == request.auth.uid
+                          || isStallMember(get(/databases/$(database)/documents/reservations/$(reservationId)).data.merchantEmail));
         allow update, delete: if false;
       }
     }

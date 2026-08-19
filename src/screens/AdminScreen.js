@@ -12,7 +12,7 @@ import {
   fetchAllDealsForAdmin, removeFoodDeal, getImpactStats,
   fetchDisputedReservations, resolveDispute,
 } from '../services/appDataService';
-import { listUsers, approveMerchant } from '../services/authService';
+import { listUsers, approveOwner } from '../services/authService';
 import { useAuth } from '../context/AuthContext';
 
 export default function AdminScreen() {
@@ -73,18 +73,19 @@ export default function AdminScreen() {
     }
   }, [user.uid]);
 
-  const handleApproveMerchant = useCallback(async (uid) => {
+  const handleApproveOwner = useCallback(async (uid) => {
     try {
-      await approveMerchant(uid);
+      await approveOwner(uid);
       setUsers((prev) => prev.map((u) => (u.uid === uid ? { ...u, verified: true } : u)));
     } catch (err) {
       Alert.alert('Could not approve', err.message || 'Please try again.');
     }
   }, []);
 
-  const pendingMerchants = users.filter((u) => u.role === 'merchant' && !u.verified);
+  const pendingOwners = users.filter((u) => u.role === 'owner' && !u.verified);
 
-  const merchantCount = users.filter((u) => u.role === 'merchant').length;
+  const ownerCount = users.filter((u) => u.role === 'owner').length;
+  const staffCount = users.filter((u) => u.role === 'staff').length;
   const customerCount = users.filter((u) => u.role === 'customer').length;
 
   return (
@@ -119,8 +120,14 @@ export default function AdminScreen() {
           <View style={styles.statsRow}>
             <Card style={styles.statCard} mode="contained">
               <Card.Content style={{ alignItems: 'center' }}>
-                <Text variant="headlineMedium" style={{ color: theme.colors.primary, fontWeight: 'bold' }}>{merchantCount}</Text>
-                <Text variant="labelSmall" style={{ color: theme.colors.onSurfaceVariant, marginTop: 4 }}>Merchants</Text>
+                <Text variant="headlineMedium" style={{ color: theme.colors.primary, fontWeight: 'bold' }}>{ownerCount}</Text>
+                <Text variant="labelSmall" style={{ color: theme.colors.onSurfaceVariant, marginTop: 4 }}>Owners</Text>
+              </Card.Content>
+            </Card>
+            <Card style={styles.statCard} mode="contained">
+              <Card.Content style={{ alignItems: 'center' }}>
+                <Text variant="headlineMedium" style={{ color: theme.colors.primary, fontWeight: 'bold' }}>{staffCount}</Text>
+                <Text variant="labelSmall" style={{ color: theme.colors.onSurfaceVariant, marginTop: 4 }}>Staff</Text>
               </Card.Content>
             </Card>
             <Card style={styles.statCard} mode="contained">
@@ -167,19 +174,19 @@ export default function AdminScreen() {
           ))}
 
           <Text variant="titleMedium" style={styles.sectionTitle}>
-            Pending Merchant Verifications ({pendingMerchants.length})
+            Pending Owner Verifications ({pendingOwners.length})
           </Text>
-          {pendingMerchants.length === 0 ? (
-            <Text style={styles.emptyText}>No merchants waiting on approval.</Text>
+          {pendingOwners.length === 0 ? (
+            <Text style={styles.emptyText}>No owners waiting on approval.</Text>
           ) : (
-            pendingMerchants.map((u) => (
+            pendingOwners.map((u) => (
               <Card key={u.uid} style={styles.userRow} mode="elevated">
                 <Card.Content style={styles.dealCardContent}>
                   <View style={{ flex: 1 }}>
                     <Text variant="titleSmall">{u.name}</Text>
                     <Text variant="bodySmall" style={{ color: theme.colors.onSurfaceVariant }}>{u.email}</Text>
                   </View>
-                  <Button mode="contained" onPress={() => handleApproveMerchant(u.uid)} compact>
+                  <Button mode="contained" onPress={() => handleApproveOwner(u.uid)} compact>
                     Approve
                   </Button>
                 </Card.Content>
@@ -216,7 +223,7 @@ export default function AdminScreen() {
                 <View>
                   <Text variant="titleSmall">{u.name}</Text>
                   <Text variant="bodySmall" style={{ color: theme.colors.onSurfaceVariant }}>{u.email}</Text>
-                  {u.role === 'merchant' && (
+                  {u.role === 'owner' && (
                     <Text
                       variant="bodySmall"
                       style={{ color: u.verified ? theme.colors.primary : theme.colors.error, fontWeight: 'bold', marginTop: 2 }}
@@ -224,12 +231,19 @@ export default function AdminScreen() {
                       {u.verified ? '✓ Verified' : '⏳ Pending'}
                     </Text>
                   )}
+                  {u.role === 'staff' && (
+                    <Text variant="bodySmall" style={{ color: theme.colors.onSurfaceVariant, marginTop: 2 }}>
+                      staff of {u.assignedOwnerEmail}
+                    </Text>
+                  )}
                 </View>
                 <Chip
                   compact
                   style={{
                     backgroundColor: u.role === 'admin' ? theme.colors.error
-                      : u.role === 'merchant' ? theme.colors.secondary : theme.colors.primaryContainer,
+                      : u.role === 'owner' ? theme.colors.secondary
+                        : u.role === 'staff' ? (theme.colors.tertiary || theme.colors.secondary)
+                          : theme.colors.primaryContainer,
                   }}
                   textStyle={{ color: u.role === 'customer' ? theme.colors.onPrimaryContainer : '#fff' }}
                 >

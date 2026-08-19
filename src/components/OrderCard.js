@@ -6,7 +6,7 @@ import {
 } from 'react-native-paper';
 import {
   classifyReservation, statusTone, canConfirmPickup, customerStatusLabel,
-  canReview, reviewAvailableAt,
+  canReview, reviewAvailableAt, canCustomerCancel, canCustomerDispute,
 } from '../utils/reservations';
 import { withAlpha } from '../utils/color';
 import { formatRelativeTime } from '../utils/time';
@@ -21,7 +21,9 @@ function toneColor(tone, theme) {
   }
 }
 
-export default function OrderCard({ reservation: r, onConfirm, onReview }) {
+export default function OrderCard({
+  reservation: r, onConfirm, onReview, onCancel, onDispute, onEditNotes, onMessage,
+}) {
   const theme = useTheme();
   const state = classifyReservation(r);
   const accent = toneColor(statusTone(state), theme);
@@ -86,6 +88,25 @@ export default function OrderCard({ reservation: r, onConfirm, onReview }) {
             {' '}— once you&apos;ve eaten it.
           </Text>
         ))}
+
+        <View style={styles.wrapRow}>
+          <Button mode="text" compact icon="message-text-outline" onPress={() => onMessage(r)}>
+            Message
+          </Button>
+          <Button mode="text" compact icon="note-edit-outline" onPress={() => onEditNotes(r)}>
+            {r.customerNotes ? 'Edit note' : 'Add note'}
+          </Button>
+          {canCustomerCancel(r) && (
+            <Button mode="text" compact onPress={() => onCancel(r)}>
+              Cancel
+            </Button>
+          )}
+          {canCustomerDispute(r) && (
+            <Button mode="text" compact onPress={() => onDispute(r)}>
+              Something wrong?
+            </Button>
+          )}
+        </View>
       </Card.Content>
     </Card>
   );
@@ -106,4 +127,7 @@ const styles = StyleSheet.create({
   pillText: { fontSize: 11, fontWeight: '600', lineHeight: 15 },
   cta: { marginTop: 12 },
   hint: { marginTop: 8 },
+  wrapRow: {
+    flexDirection: 'row', gap: 4, flexWrap: 'wrap', marginTop: 8,
+  },
 });

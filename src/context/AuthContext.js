@@ -27,10 +27,10 @@ export function AuthProvider({ children }) {
   }, []);
 
   const signUp = useCallback(async ({
-    name, email, password, role,
+    name, email, password, role, agreedToTerms, assignedOwnerEmail,
   }) => {
     await authService.signUp({
-      name, email, password, role,
+      name, email, password, role, agreedToTerms, assignedOwnerEmail,
     });
   }, []);
 

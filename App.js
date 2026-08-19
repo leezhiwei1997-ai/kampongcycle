@@ -5,7 +5,9 @@ import { AuthProvider, useAuth } from './src/context/AuthContext';
 import { paperTheme } from './src/theme/paperTheme';
 import { registerForPushNotifications } from './src/services/notificationService';
 import { updatePushToken } from './src/services/authService';
+import { hasAcceptedCurrentTerms } from './src/utils/terms';
 import ProblemView from './src/components/ProblemView';
+import TermsGateModal from './src/components/TermsGateModal';
 import LoginScreen from './src/screens/LoginScreen';
 import CustomerScreen from './src/screens/CustomerScreen';
 import MerchantScreen from './src/screens/MerchantScreen';
@@ -59,14 +61,23 @@ function Router() {
     );
   }
 
+  // Blocks everything below until the current terms are accepted (first
+  // acceptance happens at signup — see LoginScreen.js — so this only ever
+  // fires as a re-prompt after a CURRENT_TERMS_VERSION bump).
+  if (!hasAcceptedCurrentTerms(user)) {
+    return <TermsGateModal visible uid={user.uid} onSignOut={logout} />;
+  }
+
   // No default fallthrough to CustomerScreen. An unrecognised role now shows
   // itself on screen instead of silently rendering the customer app.
   // The `key` forces a remount on role change so mount effects re-run.
   switch (user.role) {
     case 'admin':
       return <AdminScreen key="admin" />;
-    case 'merchant':
-      return <MerchantScreen key="merchant" />;
+    case 'owner':
+      return <MerchantScreen key="owner" />;
+    case 'staff':
+      return <MerchantScreen key="staff" />;
     case 'customer':
       return <CustomerScreen key="customer" />;
     default:

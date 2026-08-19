@@ -2,7 +2,7 @@
 import React from 'react';
 import { View, Image, StyleSheet } from 'react-native';
 import {
-  Text, Card, Button, useTheme,
+  Text, Card, Button, Chip, useTheme,
 } from 'react-native-paper';
 import {
   classifyReservation, STATUS_LABEL, statusTone, canHandOver, needsMerchantResolution,
@@ -21,13 +21,20 @@ function toneColor(tone, theme) {
   }
 }
 
+const KITCHEN_STATUSES = [
+  { value: 'preparing', label: 'Preparing' },
+  { value: 'ready', label: 'Ready at counter' },
+  { value: 'completed', label: 'Completed' },
+];
+
 export default function ReservationCard({
-  reservation: r, onHandOver, onShowCode, onResolve, onDispute,
+  reservation: r, onHandOver, onShowCode, onResolve, onDispute, onSetMerchantStatus, onMessage,
 }) {
   const theme = useTheme();
   const state = classifyReservation(r);
   const accent = toneColor(statusTone(state), theme);
   const actionable = needsMerchantResolution(r);
+  const showKitchenStatus = state === 'awaiting' || state === 'handingOver';
 
   return (
     <Card style={[styles.card, { borderLeftColor: accent }]} mode={actionable ? 'outlined' : 'elevated'}>
@@ -64,8 +71,26 @@ export default function ReservationCard({
           </View>
         </View>
 
+        {showKitchenStatus && (
+          <View style={[styles.wrapRow, { marginTop: 10 }]}>
+            {KITCHEN_STATUSES.map((s) => (
+              <Chip
+                key={s.value}
+                compact
+                selected={r.merchantStatus === s.value}
+                onPress={() => onSetMerchantStatus(r.id, s.value)}
+              >
+                {s.label}
+              </Chip>
+            ))}
+          </View>
+        )}
+
         {state === 'awaiting' && canHandOver(r) && (
           <View style={styles.actions}>
+            <Button mode="text" icon="message-text-outline" onPress={() => onMessage(r)} compact>
+              Message
+            </Button>
             <Button mode="contained" icon="qrcode" onPress={() => onHandOver(r)} compact>
               Hand over
             </Button>
@@ -74,6 +99,9 @@ export default function ReservationCard({
 
         {state === 'handingOver' && (
           <View style={styles.actions}>
+            <Button mode="text" icon="message-text-outline" onPress={() => onMessage(r)} compact>
+              Message
+            </Button>
             <Button mode="outlined" icon="qrcode" onPress={() => onShowCode(r)} compact>
               Show code
             </Button>
@@ -118,6 +146,8 @@ const styles = StyleSheet.create({
     borderRadius: 10,
   },
   pillText: { fontSize: 11, fontWeight: '600', lineHeight: 15 },
-  actions: { flexDirection: 'row', justifyContent: 'flex-end', marginTop: 10 },
+  actions: {
+    flexDirection: 'row', justifyContent: 'flex-end', alignItems: 'center', gap: 4, marginTop: 10,
+  },
   wrapRow: { flexDirection: 'row', gap: 8, flexWrap: 'wrap' },
 });
