@@ -93,3 +93,53 @@ When I ask for "the next feature," pull from this list in order:
 I run the app myself: `npx expo start` → scan QR in Expo Go.  
 You cannot see my runtime. If something breaks, I will paste the **red error  
 text** from the terminal or Expo overlay — treat that as the source of truth.
+## Git rules — non-negotiable
+
+This project lost work once when a codespace was deleted with unpushed
+changes. Never leave work sitting only in the working tree.
+
+### After every change that leaves the app in a working state
+
+```bash
+git add -A
+git commit -m "<what changed, in plain words>"
+git push origin main
+```
+
+Then verify:
+
+```bash
+git --no-pager status --short    # must print nothing
+git --no-pager log --oneline -1  # must match what you just committed
+```
+
+Do not batch several features into one commit at the end of a session.
+Commit per working change.
+
+### Commit messages
+
+Say what the change does, not which patch it was. Future readers see only
+this line — `git log` is the only record of what happened. "Add merchant
+operating hours + open/closed on Discover" is right; "store patch" is not.
+
+### Mirror to GitLab
+
+A second remote named `gitlab` exists as a backup. Push there too:
+
+```bash
+git push gitlab main
+```
+
+If it isn't configured yet:
+
+```bash
+git remote add gitlab https://gitlab.com/<username>/kampongcycle.git
+git push -u gitlab main
+git remote -v    # should list both origin and gitlab
+```
+
+### Never
+
+- Never `git push --force` to `main`
+- Never `git reset --hard` without committing or stashing first
+- Never end a session with a dirty tree
